@@ -106,9 +106,18 @@ def refresh_access_token(refresh_token: str) -> dict:
 def get_valid_access_token() -> str:
     """
     Retorna un access_token vigente.
-    Si está por vencer (< 5 min), lo renueva automáticamente.
-    Si no hay tokens guardados, inicia el flujo de autorización.
+    En Streamlit Cloud lee el token desde los secrets.
+    En local usa el archivo .tokens.json.
     """
+    # Intentar leer desde Streamlit Secrets (Streamlit Cloud)
+    try:
+        import streamlit as st
+        token = st.secrets.get("ML_ACCESS_TOKEN")
+        if token:
+            return token
+    except Exception:
+        pass
+
     tokens = _load_tokens()
 
     if not tokens:
