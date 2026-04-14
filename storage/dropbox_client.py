@@ -58,18 +58,31 @@ class DropboxClient:
     def _connect(self) -> dropbox.Dropbox:
         """Conecta a Dropbox con refresh token (no vence) o access token."""
         try:
-            if DROPBOX_REFRESH_TOKEN and DROPBOX_APP_KEY and DROPBOX_APP_SECRET:
+            # Leer credenciales desde Streamlit Secrets o .env
+            try:
+                import streamlit as st
+                refresh_token = st.secrets.get("DROPBOX_REFRESH_TOKEN") or DROPBOX_REFRESH_TOKEN
+                app_key       = st.secrets.get("DROPBOX_APP_KEY") or DROPBOX_APP_KEY
+                app_secret    = st.secrets.get("DROPBOX_APP_SECRET") or DROPBOX_APP_SECRET
+                access_token  = st.secrets.get("DROPBOX_ACCESS_TOKEN") or DROPBOX_ACCESS_TOKEN
+            except Exception:
+                refresh_token = DROPBOX_REFRESH_TOKEN
+                app_key       = DROPBOX_APP_KEY
+                app_secret    = DROPBOX_APP_SECRET
+                access_token  = DROPBOX_ACCESS_TOKEN
+
+            if refresh_token and app_key and app_secret:
                 # Conexión con refresh token — recomendado, no vence
                 dbx = dropbox.Dropbox(
-                    app_key=DROPBOX_APP_KEY,
-                    app_secret=DROPBOX_APP_SECRET,
-                    oauth2_refresh_token=DROPBOX_REFRESH_TOKEN,
+                    app_key=app_key,
+                    app_secret=app_secret,
+                    oauth2_refresh_token=refresh_token,
                 )
-            elif DROPBOX_ACCESS_TOKEN:
+            elif access_token:
                 # Conexión con access token — vence en ~4hs
-                dbx = dropbox.Dropbox(DROPBOX_ACCESS_TOKEN)
+                dbx = dropbox.Dropbox(access_token)
             else:
-                raise ValueError("No hay credenciales de Dropbox configuradas en .env")
+                raise ValueError("No hay credenciales de Dropbox configuradas")
 
             # Verificar conexión
             account = dbx.users_get_current_account()
