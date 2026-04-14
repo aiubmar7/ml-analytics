@@ -6,7 +6,6 @@ import logging
 from datetime import datetime, timedelta, date
 import calendar
 from pathlib import Path
-from typing import Optional
 
 import pandas as pd
 
@@ -69,16 +68,10 @@ class MySalesExtractor:
         return df
 
     def get_orders_by_daterange(self, date_from: date, date_to: date) -> pd.DataFrame:
-        """
-        Trae órdenes entre dos fechas específicas.
-        Útil para comparaciones mes vs mes, año vs año, rangos personalizados.
-        """
-        user_id    = self._get_user_id()
-        from_str   = date_from.strftime("%Y-%m-%dT00:00:00.000-03:00")
-        to_str     = date_to.strftime("%Y-%m-%dT23:59:59.000-03:00")
-
+        user_id  = self._get_user_id()
+        from_str = date_from.strftime("%Y-%m-%dT00:00:00.000-03:00")
+        to_str   = date_to.strftime("%Y-%m-%dT23:59:59.000-03:00")
         logger.info(f"Extrayendo ordenes del {date_from} al {date_to}...")
-
         orders = []
         for order in self.client.get_all_pages(
             "/orders/search",
@@ -94,21 +87,19 @@ class MySalesExtractor:
         ):
             for item in order.get("order_items", []):
                 orders.append({
-                    "order_id":       order["id"],
-                    "date_created":   order["date_created"],
-                    "status":         order["status"],
-                    "total_amount":   order["total_amount"],
-                    "currency_id":    order["currency_id"],
-                    "item_id":        item["item"]["id"],
-                    "item_title":     item["item"]["title"],
-                    "quantity":       item["quantity"],
-                    "unit_price":     item["unit_price"],
-                    "sale_fee":       item.get("sale_fee", 0),
+                    "order_id":     order["id"],
+                    "date_created": order["date_created"],
+                    "status":       order["status"],
+                    "total_amount": order["total_amount"],
+                    "currency_id":  order["currency_id"],
+                    "item_id":      item["item"]["id"],
+                    "item_title":   item["item"]["title"],
+                    "quantity":     item["quantity"],
+                    "unit_price":   item["unit_price"],
+                    "sale_fee":     item.get("sale_fee", 0),
                 })
-
         if not orders:
             return pd.DataFrame()
-
         df = pd.DataFrame(orders)
         df["date_created"] = pd.to_datetime(df["date_created"])
         df["net_amount"]   = df["total_amount"] - df["sale_fee"]
@@ -116,13 +107,9 @@ class MySalesExtractor:
         return df
 
     def get_period_summary(self, date_from: date, date_to: date) -> dict:
-        """Resumen de un período específico."""
         df = self.get_orders_by_daterange(date_from, date_to)
         if df.empty:
-            return {
-                "revenue": 0, "net": 0, "orders": 0,
-                "units": 0, "avg_ticket": 0, "df": df
-            }
+            return {"revenue": 0, "net": 0, "orders": 0, "units": 0, "avg_ticket": 0, "df": df}
         df_paid = df[df["status"] == "paid"]
         return {
             "revenue":    round(float(df_paid["total_amount"].sum()), 2),
@@ -144,11 +131,7 @@ class MySalesExtractor:
 
     def get_my_items(self) -> pd.DataFrame:
         user_id = self._get_user_id()
-        logger.info("Extrayendo publicaciones propias...")
-        item_ids = list(self.client.get_all_pages(
-            f"/users/{user_id}/items/search",
-            results_key="results",
-        ))
+        item_ids = list(self.client.get_all_pages(f"/users/{user_id}/items/search", results_key="results"))
         if not item_ids:
             return pd.DataFrame()
         items_data = self.client.get_items_bulk(item_ids)
@@ -179,22 +162,6 @@ class MySalesExtractor:
             self.storage.save_dataframe(df, f"data/my_sales/items_{month_str}.parquet")
         return df
 
-    def get_item_visits(self, item_ids: list, days_back: int = 30) -> pd.DataFrame:
-        date_from = (datetime.now() - timedelta(days=days_back)).strftime("%Y-%m-%d")
-        date_to   = datetime.now().strftime("%Y-%m-%d")
-        rows = []
-        for item_id in item_ids:
-            try:
-                data = self.client.get(
-                    f"/items/{item_id}/visits",
-                    params={"date_from": date_from, "date_to": date_to},
-                )
-                for entry in data.get("results", []):
-                    rows.append({"item_id": item_id, "date": entry["date"], "total": entry["total"]})
-            except Exception as e:
-                logger.warning(f"No se pudieron obtener visitas para {item_id}: {e}")
-        return pd.DataFrame(rows) if rows else pd.DataFrame()
-
     def get_my_reputation(self) -> dict:
         try:
             user_id = self._get_user_id()
@@ -209,8 +176,7 @@ class MySalesExtractor:
                 "cancellations_rate":     data.get("metrics", {}).get("cancellations", {}).get("rate", 0),
             }
         except Exception as e:
-            import logging
-            logging.getLogger(__name__).warning(f"No se pudo obtener reputacion: {e}")
+            logger.warning(f"No se pudo obtener reputacion: {e}")
             return {"level_id": "Sin datos", "power_seller_status": "Sin datos", "claims_rate": 0}
 
     def get_summary(self, days_back: int = 30) -> dict:
@@ -230,9 +196,9 @@ class MySalesExtractor:
         }
 
     def get_monthly_forecast(self) -> dict:
-        today         = date.today()
-        days_in_month = calendar.monthrange(today.year, today.month)[1]
-        days_elapsed  = today.day
+        today          = date.today()
+        days_in_month  = calendar.monthrange(today.year, today.month)[1]
+        days_elapsed   = today.day
         days_remaining = days_in_month - days_elapsed
 
         df_month = self.get_orders(days_elapsed)
@@ -271,10 +237,10 @@ class MySalesExtractor:
         proj2_orders  = orders_so_far  + (daily_trend_orders  * days_remaining)
 
         try:
-            prev_month = today.month - 1 if today.month > 1 else 12
-            prev_year  = today.year if today.month > 1 else today.year - 1
-            prev_days  = calendar.monthrange(prev_year, prev_month)[1]
-            df_prev = self.get_orders(days_elapsed + prev_days + 5)
+            prev_month  = today.month - 1 if today.month > 1 else 12
+            prev_year   = today.year if today.month > 1 else today.year - 1
+            prev_days   = calendar.monthrange(prev_year, prev_month)[1]
+            df_prev     = self.get_orders(days_elapsed + prev_days + 5)
             df_prev_paid = df_prev[df_prev["status"] == "paid"].copy()
             df_prev_paid["date"] = df_prev_paid["date_created"].dt.date
             df_prev_paid = df_prev_paid[
@@ -282,14 +248,12 @@ class MySalesExtractor:
                 (df_prev_paid["date"] <= date(prev_year, prev_month, prev_days))
             ]
             prev_revenue = float(df_prev_paid["total_amount"].sum()) if not df_prev_paid.empty else None
-            proj3_revenue = proj1_revenue
-            proj3_units   = proj1_units
-            proj3_orders  = proj1_orders
         except Exception:
-            prev_revenue  = None
-            proj3_revenue = proj1_revenue
-            proj3_units   = proj1_units
-            proj3_orders  = proj1_orders
+            prev_revenue = None
+
+        proj3_revenue = proj1_revenue
+        proj3_units   = proj1_units
+        proj3_orders  = proj1_orders
 
         w1, w2, w3 = 0.35, 0.40, 0.25
         forecast_revenue = (proj1_revenue * w1) + (proj2_revenue * w2) + (proj3_revenue * w3)
