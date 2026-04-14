@@ -36,6 +36,21 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+st.markdown("""
+<style>
+@import url('https://fonts.cdnfonts.com/css/samsung-sans');
+html, body, [class*="css"], p, div, span, label, input, button {
+    font-family: 'Samsung Sans', sans-serif !important;
+    font-size: 14px !important;
+}
+h1 { font-size: 24px !important; }
+h2 { font-size: 20px !important; }
+h3 { font-size: 17px !important; }
+[data-testid="metric-container"] label { font-size: 13px !important; }
+[data-testid="metric-container"] [data-testid="stMetricValue"] { font-size: 20px !important; }
+</style>
+""", unsafe_allow_html=True)
+
 @st.cache_resource
 def get_clients():
     return {
@@ -342,7 +357,6 @@ elif page == "📊 Reportes":
         comparar_btn = st.button("📊 Comparar períodos")
 
         if comparar_btn:
-            # Intentar cargar desde Dropbox primero
             def load_from_dropbox_or_api(date_from, date_to, storage, sales):
                 dfs = []
                 current = date(date_from.year, date_from.month, 1)
@@ -371,7 +385,6 @@ elif page == "📊 Reportes":
                             "avg_ticket": round(float(df_paid["total_amount"].mean()), 2) if not df_paid.empty else 0,
                             "df":         df_paid,
                         }
-                # Fallback a API
                 return sales.get_period_summary(date_from, date_to)
 
             with st.spinner("Cargando datos de ambos períodos..."):
