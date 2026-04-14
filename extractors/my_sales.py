@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 class MySalesExtractor:
 
     def __init__(self):
-        self.client = MLClient()
+        self.client  = MLClient()
         self.storage = DropboxClient()
         self.user_id = None
 
@@ -195,6 +195,20 @@ class MySalesExtractor:
             "reputation":    self.get_my_reputation(),
         }
 
+    def _load_historical_month(self, year: int, month: int) -> pd.DataFrame:
+        """Carga un mes desde Dropbox historial."""
+        try:
+            path = f"data/historical/{year:04d}-{month:02d}.parquet"
+            df = self.storage.load_dataframe(path)
+            if df is not None and not df.empty:
+                df["date_created"] = pd.to_datetime(df["date_created"])
+                df["date"] = df["date_created"].dt.date
+                if "net_amount" not in df.columns:
+                    df["net_amount"] = df["total_amount"] - df.get("sale_fee", 0)
+            return df
+        except Exception:
+            return None
+
     def get_monthly_forecast(self) -> dict:
         today          = date.today()
         days_in_month  = calendar.monthrange(today.year, today.month)[1]
@@ -221,21 +235,22 @@ class MySalesExtractor:
         daily_avg_units   = units_so_far   / days_elapsed
         daily_avg_orders  = orders_so_far  / days_elapsed
 
+        # ── Factor 1: Promedio diario del mes (25%) ───────────────
         proj1_revenue = revenue_so_far + (daily_avg_revenue * days_remaining)
         proj1_units   = units_so_far   + (daily_avg_units   * days_remaining)
         proj1_orders  = orders_so_far  + (daily_avg_orders  * days_remaining)
 
+        # ── Factor 2: Tendencia últimos 7 días (30%) ──────────────
         last7 = df_paid[df_paid["date"] >= (today - timedelta(days=6))]
         days7 = max(len(last7["date"].unique()), 1)
-
         daily_trend_revenue = float(last7["total_amount"].sum()) / days7
         daily_trend_units   = float(last7["quantity"].sum())     / days7
         daily_trend_orders  = last7["order_id"].nunique()        / days7
-
         proj2_revenue = revenue_so_far + (daily_trend_revenue * days_remaining)
         proj2_units   = units_so_far   + (daily_trend_units   * days_remaining)
         proj2_orders  = orders_so_far  + (daily_trend_orders  * days_remaining)
 
+        # ── Factor 3: Mismo mes año anterior (20%) ────────────────
         try:
             prev_month  = today.month - 1 if today.month > 1 else 12
             prev_year   = today.year if today.month > 1 else today.year - 1
@@ -254,15 +269,82 @@ class MySalesExtractor:
         proj3_revenue = proj1_revenue
         proj3_units   = proj1_units
         proj3_orders  = proj1_orders
+        ly_revenue    = None
 
-        w1, w2, w3 = 0.35, 0.40, 0.25
-        forecast_revenue = (proj1_revenue * w1) + (proj2_revenue * w2) + (proj3_revenue * w3)
-        forecast_units   = (proj1_units   * w1) + (proj2_units   * w2) + (proj3_units   * w3)
-        forecast_orders  = (proj1_orders  * w1) + (proj2_orders  * w2) + (proj3_orders  * w3)
+        # Intentar con año anterior desde historial Dropbox
+        try:
+            df_ly = self._load_historical_month(today.year - 1, today.month)
+            if df_ly is not None and not df_ly.empty:
+                df_ly_paid = df_ly[df_ly["status"] == "paid"]
+                ly_revenue = float(df_ly_paid["total_amount"].sum())
+                if ly_revenue > 0:
+                    ly_daily   = ly_revenue / days_in_month
+                    growth_factor = daily_avg_revenue / ly_daily if ly_daily > 0 else 1
+                    proj3_revenue = ly_revenue * growth_factor
+                    proj3_units   = float(df_ly_paid["quantity"].sum()) * growth_factor
+                    proj3_orders  = df_ly_paid["order_id"].nunique() * growth_factor
+        except Exception:
+            pass
 
+        # ── Factor 4: Estacionalidad histórica (15%) ──────────────
+        # Promedio de este mismo mes en los últimos años disponibles en Dropbox
+        proj4_revenue = proj1_revenue
+        seasonal_revenues = []
+        for yr in range(today.year - 3, today.year):
+            try:
+                df_hist = self._load_historical_month(yr, today.month)
+                if df_hist is not None and not df_hist.empty:
+                    df_hist_paid = df_hist[df_hist["status"] == "paid"]
+                    hist_rev = float(df_hist_paid["total_amount"].sum())
+                    if hist_rev > 0:
+                        seasonal_revenues.append(hist_rev)
+            except Exception:
+                pass
+
+        if seasonal_revenues:
+            avg_seasonal = sum(seasonal_revenues) / len(seasonal_revenues)
+            # Ajustar por crecimiento actual vs histórico
+            if avg_seasonal > 0:
+                growth_rate   = daily_avg_revenue / (avg_seasonal / days_in_month)
+                proj4_revenue = avg_seasonal * growth_rate
+                proj4_units   = proj1_units * (proj4_revenue / proj1_revenue) if proj1_revenue > 0 else proj1_units
+                proj4_orders  = proj1_orders * (proj4_revenue / proj1_revenue) if proj1_revenue > 0 else proj1_orders
+        else:
+            proj4_units  = proj1_units
+            proj4_orders = proj1_orders
+
+        # ── Factor 5: Velocidad de crecimiento reciente (10%) ─────
+        # Compara promedio últimos 3 días vs días 4-10
+        last3  = df_paid[df_paid["date"] >= (today - timedelta(days=2))]
+        prev7  = df_paid[(df_paid["date"] >= (today - timedelta(days=9))) &
+                         (df_paid["date"] <  (today - timedelta(days=2)))]
+
+        days3  = max(len(last3["date"].unique()), 1)
+        days_p = max(len(prev7["date"].unique()), 1)
+
+        avg3   = float(last3["total_amount"].sum()) / days3 if not last3.empty else daily_avg_revenue
+        avg_p  = float(prev7["total_amount"].sum()) / days_p if not prev7.empty else daily_avg_revenue
+
+        # Factor de aceleración (limitado entre 0.5x y 2x para evitar extremos)
+        acceleration = max(0.5, min(2.0, avg3 / avg_p if avg_p > 0 else 1.0))
+        proj5_revenue = revenue_so_far + (daily_avg_revenue * acceleration * days_remaining)
+        proj5_units   = units_so_far   + (daily_avg_units   * acceleration * days_remaining)
+        proj5_orders  = orders_so_far  + (daily_avg_orders  * acceleration * days_remaining)
+
+        # ── Proyección ponderada (5 factores) ─────────────────────
+        w1, w2, w3, w4, w5 = 0.25, 0.30, 0.20, 0.15, 0.10
+        forecast_revenue = (proj1_revenue * w1) + (proj2_revenue * w2) + (proj3_revenue * w3) + (proj4_revenue * w4) + (proj5_revenue * w5)
+        forecast_units   = (proj1_units   * w1) + (proj2_units   * w2) + (proj3_units   * w3) + (proj4_units   * w4) + (proj5_units   * w5)
+        forecast_orders  = (proj1_orders  * w1) + (proj2_orders  * w2) + (proj3_orders  * w3) + (proj4_orders  * w4) + (proj5_orders  * w5)
+
+        # ── Comparaciones ─────────────────────────────────────────
         vs_prev_pct = None
         if prev_revenue and prev_revenue > 0:
             vs_prev_pct = round((forecast_revenue - prev_revenue) / prev_revenue * 100, 1)
+
+        vs_ly_pct = None
+        if ly_revenue and ly_revenue > 0:
+            vs_ly_pct = round((forecast_revenue - ly_revenue) / ly_revenue * 100, 1)
 
         return {
             "month":               today.strftime("%B %Y"),
@@ -278,12 +360,16 @@ class MySalesExtractor:
             "forecast_orders":     round(forecast_orders),
             "forecast_net":        round(forecast_revenue * (net_so_far / revenue_so_far) if revenue_so_far > 0 else 0, 2),
             "vs_prev_month_pct":   vs_prev_pct,
-            "vs_last_year_pct":    None,
+            "vs_last_year_pct":    vs_ly_pct,
             "prev_month_revenue":  round(prev_revenue, 2) if prev_revenue else None,
-            "last_year_revenue":   None,
+            "last_year_revenue":   round(ly_revenue, 2) if ly_revenue else None,
             "proj_daily_avg":      round(proj1_revenue, 2),
             "proj_trend_7d":       round(proj2_revenue, 2),
             "proj_last_year":      round(proj3_revenue, 2),
+            "proj_seasonal":       round(proj4_revenue, 2),
+            "proj_acceleration":   round(proj5_revenue, 2),
+            "acceleration_factor": round(acceleration, 2),
+            "seasonal_years":      len(seasonal_revenues),
             "daily_avg_revenue":   round(daily_avg_revenue, 2),
             "daily_trend_revenue": round(daily_trend_revenue, 2),
         }
