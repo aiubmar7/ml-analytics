@@ -31,10 +31,10 @@ ML_REDIRECT_URI = _get("ML_REDIRECT_URI", "https://www.google.com")
 ML_SITE_ID      = _get("ML_SITE_ID", "MLU")
 
 # ─── Dropbox ──────────────────────────────────────────────────────
-DROPBOX_ACCESS_TOKEN  = _get("DROPBOX_ACCESS_TOKEN")
-DROPBOX_REFRESH_TOKEN = _get("DROPBOX_REFRESH_TOKEN")
-DROPBOX_APP_KEY       = _get("DROPBOX_APP_KEY")
-DROPBOX_APP_SECRET    = _get("DROPBOX_APP_SECRET")
+DROPBOX_ACCESS_TOKEN  = _get("DROPBOX_ACCESS_TOKEN", "")
+DROPBOX_REFRESH_TOKEN = _get("DROPBOX_REFRESH_TOKEN", "")
+DROPBOX_APP_KEY       = _get("DROPBOX_APP_KEY", "")
+DROPBOX_APP_SECRET    = _get("DROPBOX_APP_SECRET", "")
 
 # Carpeta raíz dentro de Dropbox donde se guardarán los datos
 DROPBOX_BASE_PATH = "/ml_analytics"
