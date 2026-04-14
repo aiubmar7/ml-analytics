@@ -51,7 +51,7 @@ st.sidebar.markdown("---")
 
 page = st.sidebar.radio(
     "Módulo",
-    ["🏠 Resumen", "💰 Mis Ventas", "📊 Reportes", "🔍 Competencia", "📈 Tendencias", "🔑 Keywords"],
+    ["🏠 Resumen", "💰 Mis Ventas", "📊 Reportes", "🗄️ Historial", "🔍 Competencia", "📈 Tendencias", "🔑 Keywords"],
 )
 
 st.sidebar.markdown("---")
@@ -60,13 +60,6 @@ st.sidebar.markdown(f"*Período: últimos {days_back} días*")
 
 def fmt_currency(value: float, currency: str = "UYU") -> str:
     return f"${value:,.0f} {currency}"
-
-def period_metrics(summary: dict, label: str):
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric(f"{label} — Ingresos", fmt_currency(summary["revenue"]))
-    c2.metric("Neto", fmt_currency(summary["net"]))
-    c3.metric("Órdenes", f"{summary['orders']:,}")
-    c4.metric("Unidades", f"{summary['units']:,}")
 
 # ══════════════════════════════════════════════════════════════════
 # PÁGINA: RESUMEN
@@ -242,20 +235,21 @@ elif page == "📊 Reportes":
 
     today = date.today()
 
-    # ── Mes actual vs mes anterior ────────────────────────────────
+    def delta_pct(actual, prev):
+        if prev and prev > 0:
+            return f"{((actual - prev) / prev * 100):+.1f}%"
+        return None
+
     if tipo == "📅 Mes actual vs mes anterior":
         st.subheader("Mes actual vs mes anterior")
 
-        # Mes actual
         mes_actual_inicio = date(today.year, today.month, 1)
         mes_actual_fin    = today
-
-        # Mes anterior
-        prev_month     = today.month - 1 if today.month > 1 else 12
-        prev_year      = today.year if today.month > 1 else today.year - 1
-        prev_days      = calendar.monthrange(prev_year, prev_month)[1]
-        mes_prev_inicio = date(prev_year, prev_month, 1)
-        mes_prev_fin    = date(prev_year, prev_month, prev_days)
+        prev_month        = today.month - 1 if today.month > 1 else 12
+        prev_year         = today.year if today.month > 1 else today.year - 1
+        prev_days         = calendar.monthrange(prev_year, prev_month)[1]
+        mes_prev_inicio   = date(prev_year, prev_month, 1)
+        mes_prev_fin      = date(prev_year, prev_month, prev_days)
 
         with st.spinner("Cargando datos de ambos meses..."):
             try:
@@ -265,40 +259,22 @@ elif page == "📊 Reportes":
                 st.error(f"Error: {e}")
                 st.stop()
 
-        # KPIs comparativos
         st.markdown(f"#### {mes_actual_inicio.strftime('%B %Y')} vs {mes_prev_inicio.strftime('%B %Y')}")
-
         c1, c2, c3, c4 = st.columns(4)
-        def delta_pct(actual, prev):
-            if prev and prev > 0:
-                return f"{((actual - prev) / prev * 100):+.1f}%"
-            return None
+        c1.metric("Ingresos brutos", fmt_currency(actual["revenue"]), delta=delta_pct(actual["revenue"], prev["revenue"]))
+        c2.metric("Ingresos netos", fmt_currency(actual["net"]), delta=delta_pct(actual["net"], prev["net"]))
+        c3.metric("Órdenes", f"{actual['orders']:,}", delta=delta_pct(actual["orders"], prev["orders"]))
+        c4.metric("Unidades", f"{actual['units']:,}", delta=delta_pct(actual["units"], prev["units"]))
 
-        c1.metric("Ingresos brutos", fmt_currency(actual["revenue"]),
-                  delta=delta_pct(actual["revenue"], prev["revenue"]))
-        c2.metric("Ingresos netos", fmt_currency(actual["net"]),
-                  delta=delta_pct(actual["net"], prev["net"]))
-        c3.metric("Órdenes", f"{actual['orders']:,}",
-                  delta=delta_pct(actual["orders"], prev["orders"]))
-        c4.metric("Unidades", f"{actual['units']:,}",
-                  delta=delta_pct(actual["units"], prev["units"]))
-
-        st.markdown("---")
-
-        # Gráfico comparativo diario
         if not actual["df"].empty and not prev["df"].empty:
             df_act = actual["df"].copy()
             df_prv = prev["df"].copy()
-
             df_act["dia"] = df_act["date_created"].dt.day
             df_prv["dia"] = df_prv["date_created"].dt.day
-
             daily_act = df_act.groupby("dia")["total_amount"].sum().reset_index()
             daily_prv = df_prv.groupby("dia")["total_amount"].sum().reset_index()
-
             daily_act["mes"] = mes_actual_inicio.strftime("%B %Y")
             daily_prv["mes"] = mes_prev_inicio.strftime("%B %Y")
-
             df_chart = pd.concat([daily_act, daily_prv])
             fig = px.line(df_chart, x="dia", y="total_amount", color="mes",
                           title="Facturación diaria comparada",
@@ -306,31 +282,21 @@ elif page == "📊 Reportes":
                           color_discrete_sequence=["#3483FA", "#FFE600"])
             st.plotly_chart(fig, use_container_width=True)
 
-        # Tabla resumen
-        st.markdown("#### Resumen comparativo")
         resumen = pd.DataFrame({
             "Métrica": ["Ingresos brutos", "Ingresos netos", "Órdenes", "Unidades", "Ticket promedio"],
-            mes_actual_inicio.strftime("%B %Y"): [
-                fmt_currency(actual["revenue"]), fmt_currency(actual["net"]),
-                actual["orders"], actual["units"], fmt_currency(actual["avg_ticket"])
-            ],
-            mes_prev_inicio.strftime("%B %Y"): [
-                fmt_currency(prev["revenue"]), fmt_currency(prev["net"]),
-                prev["orders"], prev["units"], fmt_currency(prev["avg_ticket"])
-            ],
+            mes_actual_inicio.strftime("%B %Y"): [fmt_currency(actual["revenue"]), fmt_currency(actual["net"]), actual["orders"], actual["units"], fmt_currency(actual["avg_ticket"])],
+            mes_prev_inicio.strftime("%B %Y"):   [fmt_currency(prev["revenue"]),   fmt_currency(prev["net"]),   prev["orders"],   prev["units"],   fmt_currency(prev["avg_ticket"])],
         })
         st.dataframe(resumen, use_container_width=True, hide_index=True)
 
-    # ── Mes actual vs mismo mes año pasado ────────────────────────
     elif tipo == "📆 Mes actual vs mismo mes año pasado":
         st.subheader("Mes actual vs mismo mes del año pasado")
 
         mes_actual_inicio = date(today.year, today.month, 1)
         mes_actual_fin    = today
-
-        ly_inicio = date(today.year - 1, today.month, 1)
-        ly_dias   = calendar.monthrange(today.year - 1, today.month)[1]
-        ly_fin    = date(today.year - 1, today.month, ly_dias)
+        ly_inicio         = date(today.year - 1, today.month, 1)
+        ly_dias           = calendar.monthrange(today.year - 1, today.month)[1]
+        ly_fin            = date(today.year - 1, today.month, ly_dias)
 
         with st.spinner("Cargando datos..."):
             try:
@@ -341,41 +307,22 @@ elif page == "📊 Reportes":
                 st.stop()
 
         st.markdown(f"#### {mes_actual_inicio.strftime('%B %Y')} vs {ly_inicio.strftime('%B %Y')}")
-
         c1, c2, c3, c4 = st.columns(4)
-        def delta_pct(actual, prev):
-            if prev and prev > 0:
-                return f"{((actual - prev) / prev * 100):+.1f}%"
-            return None
-
-        c1.metric("Ingresos brutos", fmt_currency(actual["revenue"]),
-                  delta=delta_pct(actual["revenue"], ly["revenue"]))
-        c2.metric("Ingresos netos", fmt_currency(actual["net"]),
-                  delta=delta_pct(actual["net"], ly["net"]))
-        c3.metric("Órdenes", f"{actual['orders']:,}",
-                  delta=delta_pct(actual["orders"], ly["orders"]))
-        c4.metric("Unidades", f"{actual['units']:,}",
-                  delta=delta_pct(actual["units"], ly["units"]))
+        c1.metric("Ingresos brutos", fmt_currency(actual["revenue"]), delta=delta_pct(actual["revenue"], ly["revenue"]))
+        c2.metric("Ingresos netos", fmt_currency(actual["net"]), delta=delta_pct(actual["net"], ly["net"]))
+        c3.metric("Órdenes", f"{actual['orders']:,}", delta=delta_pct(actual["orders"], ly["orders"]))
+        c4.metric("Unidades", f"{actual['units']:,}", delta=delta_pct(actual["units"], ly["units"]))
 
         if ly["revenue"] == 0:
-            st.info("No hay datos del año pasado disponibles en la API de ML.")
+            st.warning("No hay datos del año pasado en la API. Cargá el historial desde el módulo 🗄️ Historial.")
 
-        # Tabla resumen
-        st.markdown("#### Resumen comparativo")
         resumen = pd.DataFrame({
             "Métrica": ["Ingresos brutos", "Ingresos netos", "Órdenes", "Unidades", "Ticket promedio"],
-            mes_actual_inicio.strftime("%B %Y"): [
-                fmt_currency(actual["revenue"]), fmt_currency(actual["net"]),
-                actual["orders"], actual["units"], fmt_currency(actual["avg_ticket"])
-            ],
-            ly_inicio.strftime("%B %Y"): [
-                fmt_currency(ly["revenue"]), fmt_currency(ly["net"]),
-                ly["orders"], ly["units"], fmt_currency(ly["avg_ticket"])
-            ],
+            mes_actual_inicio.strftime("%B %Y"): [fmt_currency(actual["revenue"]), fmt_currency(actual["net"]), actual["orders"], actual["units"], fmt_currency(actual["avg_ticket"])],
+            ly_inicio.strftime("%B %Y"):         [fmt_currency(ly["revenue"]),     fmt_currency(ly["net"]),     ly["orders"],     ly["units"],     fmt_currency(ly["avg_ticket"])],
         })
         st.dataframe(resumen, use_container_width=True, hide_index=True)
 
-    # ── Rango personalizado ───────────────────────────────────────
     elif tipo == "🗓️ Rango personalizado":
         st.subheader("Comparar dos períodos personalizados")
 
@@ -395,10 +342,42 @@ elif page == "📊 Reportes":
         comparar_btn = st.button("📊 Comparar períodos")
 
         if comparar_btn:
+            # Intentar cargar desde Dropbox primero
+            def load_from_dropbox_or_api(date_from, date_to, storage, sales):
+                dfs = []
+                current = date(date_from.year, date_from.month, 1)
+                while current <= date_to:
+                    path = f"data/historical/{current.strftime('%Y-%m')}.parquet"
+                    df_cached = storage.load_dataframe(path)
+                    if df_cached is not None:
+                        dfs.append(df_cached)
+                    if current.month == 12:
+                        current = date(current.year + 1, 1, 1)
+                    else:
+                        current = date(current.year, current.month + 1, 1)
+
+                if dfs:
+                    df_all = pd.concat(dfs, ignore_index=True)
+                    df_all["date_created"] = pd.to_datetime(df_all["date_created"])
+                    df_all["date"] = df_all["date_created"].dt.date
+                    df_filtered = df_all[(df_all["date"] >= date_from) & (df_all["date"] <= date_to)]
+                    if not df_filtered.empty:
+                        df_paid = df_filtered[df_filtered["status"] == "paid"]
+                        return {
+                            "revenue":    round(float(df_paid["total_amount"].sum()), 2),
+                            "net":        round(float(df_paid["net_amount"].sum()), 2),
+                            "orders":     df_paid["order_id"].nunique(),
+                            "units":      int(df_paid["quantity"].sum()),
+                            "avg_ticket": round(float(df_paid["total_amount"].mean()), 2) if not df_paid.empty else 0,
+                            "df":         df_paid,
+                        }
+                # Fallback a API
+                return sales.get_period_summary(date_from, date_to)
+
             with st.spinner("Cargando datos de ambos períodos..."):
                 try:
-                    periodo_a = clients["sales"].get_period_summary(a_desde, a_hasta)
-                    periodo_b = clients["sales"].get_period_summary(b_desde, b_hasta)
+                    periodo_a = load_from_dropbox_or_api(a_desde, a_hasta, clients["storage"], clients["sales"])
+                    periodo_b = load_from_dropbox_or_api(b_desde, b_hasta, clients["storage"], clients["sales"])
                 except Exception as e:
                     st.error(f"Error: {e}")
                     st.stop()
@@ -407,33 +386,19 @@ elif page == "📊 Reportes":
             label_b = f"{b_desde} → {b_hasta}"
 
             st.markdown(f"#### {label_a} vs {label_b}")
-
             c1, c2, c3, c4 = st.columns(4)
-            def delta_pct(actual, prev):
-                if prev and prev > 0:
-                    return f"{((actual - prev) / prev * 100):+.1f}%"
-                return None
+            c1.metric("Ingresos brutos", fmt_currency(periodo_a["revenue"]), delta=delta_pct(periodo_a["revenue"], periodo_b["revenue"]))
+            c2.metric("Ingresos netos", fmt_currency(periodo_a["net"]), delta=delta_pct(periodo_a["net"], periodo_b["net"]))
+            c3.metric("Órdenes", f"{periodo_a['orders']:,}", delta=delta_pct(periodo_a["orders"], periodo_b["orders"]))
+            c4.metric("Unidades", f"{periodo_a['units']:,}", delta=delta_pct(periodo_a["units"], periodo_b["units"]))
 
-            c1.metric("Ingresos brutos", fmt_currency(periodo_a["revenue"]),
-                      delta=delta_pct(periodo_a["revenue"], periodo_b["revenue"]))
-            c2.metric("Ingresos netos", fmt_currency(periodo_a["net"]),
-                      delta=delta_pct(periodo_a["net"], periodo_b["net"]))
-            c3.metric("Órdenes", f"{periodo_a['orders']:,}",
-                      delta=delta_pct(periodo_a["orders"], periodo_b["orders"]))
-            c4.metric("Unidades", f"{periodo_a['units']:,}",
-                      delta=delta_pct(periodo_a["units"], periodo_b["units"]))
-
-            # Gráfico comparativo
             if not periodo_a["df"].empty and not periodo_b["df"].empty:
                 df_a = periodo_a["df"].copy()
                 df_b = periodo_b["df"].copy()
-
                 df_a["periodo"] = label_a
                 df_b["periodo"] = label_b
-
                 df_all = pd.concat([df_a, df_b])
                 df_all["fecha"] = df_all["date_created"].dt.date
-
                 daily_all = df_all.groupby(["fecha", "periodo"])["total_amount"].sum().reset_index()
                 fig = px.line(daily_all, x="fecha", y="total_amount", color="periodo",
                               title="Facturación diaria comparada",
@@ -441,19 +406,74 @@ elif page == "📊 Reportes":
                               color_discrete_sequence=["#3483FA", "#FFE600"])
                 st.plotly_chart(fig, use_container_width=True)
 
-            # Tabla resumen
             resumen = pd.DataFrame({
                 "Métrica": ["Ingresos brutos", "Ingresos netos", "Órdenes", "Unidades", "Ticket promedio"],
-                label_a: [
-                    fmt_currency(periodo_a["revenue"]), fmt_currency(periodo_a["net"]),
-                    periodo_a["orders"], periodo_a["units"], fmt_currency(periodo_a["avg_ticket"])
-                ],
-                label_b: [
-                    fmt_currency(periodo_b["revenue"]), fmt_currency(periodo_b["net"]),
-                    periodo_b["orders"], periodo_b["units"], fmt_currency(periodo_b["avg_ticket"])
-                ],
+                label_a: [fmt_currency(periodo_a["revenue"]), fmt_currency(periodo_a["net"]), periodo_a["orders"], periodo_a["units"], fmt_currency(periodo_a["avg_ticket"])],
+                label_b: [fmt_currency(periodo_b["revenue"]), fmt_currency(periodo_b["net"]), periodo_b["orders"], periodo_b["units"], fmt_currency(periodo_b["avg_ticket"])],
             })
             st.dataframe(resumen, use_container_width=True, hide_index=True)
+
+
+# ══════════════════════════════════════════════════════════════════
+# PÁGINA: HISTORIAL
+# ══════════════════════════════════════════════════════════════════
+
+elif page == "🗄️ Historial":
+    st.title("🗄️ Carga de Historial")
+    clients = get_clients()
+
+    st.info("Cargá datos históricos mes a mes en Dropbox. Solo necesitás hacerlo una vez por período.")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        fecha_desde = st.date_input("Desde", value=date(2024, 1, 1))
+    with col2:
+        fecha_hasta = st.date_input("Hasta", value=date.today())
+
+    cargar_btn = st.button("📥 Cargar historial en Dropbox")
+
+    if cargar_btn:
+        if fecha_desde >= fecha_hasta:
+            st.error("La fecha de inicio debe ser anterior a la fecha final.")
+            st.stop()
+
+        meses = []
+        current = date(fecha_desde.year, fecha_desde.month, 1)
+        while current <= fecha_hasta:
+            days_in_month = calendar.monthrange(current.year, current.month)[1]
+            mes_fin = date(current.year, current.month, min(days_in_month,
+                          fecha_hasta.day if current.year == fecha_hasta.year and current.month == fecha_hasta.month
+                          else days_in_month))
+            meses.append((current, mes_fin))
+            if current.month == 12:
+                current = date(current.year + 1, 1, 1)
+            else:
+                current = date(current.year, current.month + 1, 1)
+
+        st.info(f"Se cargarán **{len(meses)} meses** desde {fecha_desde} hasta {fecha_hasta}")
+
+        progress_bar = st.progress(0)
+        status_text  = st.empty()
+        results      = []
+
+        for i, (mes_inicio, mes_fin) in enumerate(meses):
+            label = mes_inicio.strftime("%B %Y")
+            status_text.text(f"Cargando {label}...")
+            try:
+                df = clients["sales"].get_orders_by_daterange(mes_inicio, mes_fin)
+                if not df.empty:
+                    path = f"data/historical/{mes_inicio.strftime('%Y-%m')}.parquet"
+                    clients["storage"].save_dataframe(df, path)
+                    results.append({"Mes": label, "Órdenes": len(df), "Estado": "OK"})
+                else:
+                    results.append({"Mes": label, "Órdenes": 0, "Estado": "Sin datos"})
+            except Exception as e:
+                results.append({"Mes": label, "Órdenes": 0, "Estado": f"Error: {str(e)[:50]}"})
+            progress_bar.progress((i + 1) / len(meses))
+
+        status_text.text("Carga completada")
+        st.success(f"Historial cargado. {len([r for r in results if r['Estado'] == 'OK'])} meses exitosos.")
+        st.dataframe(pd.DataFrame(results), use_container_width=True, hide_index=True)
 
 
 # ══════════════════════════════════════════════════════════════════
