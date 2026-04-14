@@ -165,15 +165,28 @@ if page == "🏠 Resumen":
         with ac3:
             st.metric("Promedio diario (últ. 7d)", fmt_currency(forecast["daily_trend_revenue"]))
 
-        with st.expander("🔍 Detalle del cálculo (3 factores)"):
+        with st.expander("🔍 Detalle del cálculo (5 factores)"):
             d1, d2, d3 = st.columns(3)
             with d1:
-                st.metric("Promedio diario del mes", fmt_currency(forecast["proj_daily_avg"]), help="Peso: 35%")
+                st.metric("1️⃣ Promedio diario del mes", fmt_currency(forecast["proj_daily_avg"]), help="Peso: 25%")
             with d2:
-                st.metric("Tendencia últimos 7 días", fmt_currency(forecast["proj_trend_7d"]), help="Peso: 40%")
+                st.metric("2️⃣ Tendencia últimos 7 días", fmt_currency(forecast["proj_trend_7d"]), help="Peso: 30%")
             with d3:
                 ly = forecast.get("last_year_revenue")
-                st.metric("Mismo mes año anterior", fmt_currency(ly) if ly else "Sin datos", help="Peso: 25%")
+                st.metric("3️⃣ Mismo mes año anterior", fmt_currency(ly) if ly else "Sin datos", help="Peso: 20%")
+            d4, d5 = st.columns(2)
+            with d4:
+                seasonal = forecast.get("proj_seasonal")
+                yrs = forecast.get("seasonal_years", 0)
+                label = f"4️⃣ Estacionalidad ({yrs} años)" if yrs > 0 else "4️⃣ Estacionalidad histórica"
+                st.metric(label, fmt_currency(seasonal) if seasonal else "Sin datos", help="Peso: 15%")
+            with d5:
+                acc = forecast.get("acceleration_factor", 1.0)
+                arrow = "📈" if acc > 1 else "📉" if acc < 1 else "➡️"
+                st.metric("5️⃣ Velocidad de crecimiento", fmt_currency(forecast.get("proj_acceleration", 0)),
+                          delta=f"{arrow} Factor: {acc:.2f}x", help="Peso: 10%")
+            if forecast.get("vs_last_year_pct") is not None:
+                st.info(f"📊 Crecimiento vs mismo mes del año anterior: **{forecast['vs_last_year_pct']:+.1f}%**")
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -257,7 +270,6 @@ elif page == "📊 Reportes":
 
     if tipo == "📅 Mes actual vs mes anterior":
         st.subheader("Mes actual vs mes anterior")
-
         mes_actual_inicio = date(today.year, today.month, 1)
         mes_actual_fin    = today
         prev_month        = today.month - 1 if today.month > 1 else 12
@@ -306,7 +318,6 @@ elif page == "📊 Reportes":
 
     elif tipo == "📆 Mes actual vs mismo mes año pasado":
         st.subheader("Mes actual vs mismo mes del año pasado")
-
         mes_actual_inicio = date(today.year, today.month, 1)
         mes_actual_fin    = today
         ly_inicio         = date(today.year - 1, today.month, 1)
@@ -340,7 +351,6 @@ elif page == "📊 Reportes":
 
     elif tipo == "🗓️ Rango personalizado":
         st.subheader("Comparar dos períodos personalizados")
-
         col_a, col_b = st.columns(2)
         with col_a:
             st.markdown("**Período A**")
