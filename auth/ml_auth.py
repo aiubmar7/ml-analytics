@@ -1,11 +1,5 @@
 """
 Autenticación con Mercado Libre usando OAuth2.
-
-Flujo:
-  1. Primera vez: genera URL de autorización → usuario autoriza → obtenés code
-  2. Intercambiás code por access_token + refresh_token
-  3. Guardás tokens (local + Dropbox)
-  4. Cuando el access_token vence (6hs), usás refresh_token para renovarlo automáticamente
 """
 
 import json
@@ -24,10 +18,7 @@ from config import (
 )
 
 
-# ─── Helpers de persistencia ─────────────────────────────────────
-
 def _load_tokens() -> dict:
-    """Carga tokens desde archivo local."""
     path = Path(TOKENS_LOCAL_PATH)
     if path.exists():
         return json.loads(path.read_text())
@@ -35,17 +26,10 @@ def _load_tokens() -> dict:
 
 
 def _save_tokens(tokens: dict) -> None:
-    """Guarda tokens en archivo local."""
     Path(TOKENS_LOCAL_PATH).write_text(json.dumps(tokens, indent=2))
 
 
-# ─── Paso 1: Generar URL de autorización ─────────────────────────
-
 def get_auth_url() -> str:
-    """
-    Retorna la URL a la que el usuario debe ir para autorizar la app.
-    Después de autorizar, ML redirige a REDIRECT_URI?code=XXXX
-    """
     params = {
         "response_type": "code",
         "client_id": ML_APP_ID,
@@ -54,13 +38,7 @@ def get_auth_url() -> str:
     return f"{ML_AUTH_URL}?{urlencode(params)}"
 
 
-# ─── Paso 2: Intercambiar code por tokens ────────────────────────
-
 def exchange_code_for_tokens(code: str) -> dict:
-    """
-    Intercambia el código de autorización por access_token y refresh_token.
-    Llama a esto una sola vez con el código que ML te devuelve en la URL.
-    """
     payload = {
         "grant_type":    "authorization_code",
         "client_id":     ML_APP_ID,
@@ -70,7 +48,6 @@ def exchange_code_for_tokens(code: str) -> dict:
     }
     resp = requests.post(ML_TOKEN_URL, data=payload)
     resp.raise_for_status()
-
     tokens = resp.json()
     tokens["obtained_at"] = time.time()
     _save_tokens(tokens)
@@ -78,13 +55,7 @@ def exchange_code_for_tokens(code: str) -> dict:
     return tokens
 
 
-# ─── Paso 3: Renovar access_token con refresh_token ──────────────
-
 def refresh_access_token(refresh_token: str) -> dict:
-    """
-    Renueva el access_token usando el refresh_token.
-    ML access_tokens duran 6 horas.
-    """
     payload = {
         "grant_type":    "refresh_token",
         "client_id":     ML_APP_ID,
@@ -93,7 +64,6 @@ def refresh_access_token(refresh_token: str) -> dict:
     }
     resp = requests.post(ML_TOKEN_URL, data=payload)
     resp.raise_for_status()
-
     tokens = resp.json()
     tokens["obtained_at"] = time.time()
     _save_tokens(tokens)
@@ -101,23 +71,23 @@ def refresh_access_token(refresh_token: str) -> dict:
     return tokens
 
 
-# ─── Paso 4: Obtener token válido (auto-refresh) ─────────────────
-
 def get_valid_access_token() -> str:
     """
     Retorna un access_token vigente.
     En Streamlit Cloud lee el token desde los secrets.
-    En local usa el archivo .tokens.json.
+    En local usa el archivo .tokens.json con auto-refresh.
     """
-    # Intentar leer desde Streamlit Secrets (Streamlit Cloud)
+    # 1. Intentar leer desde Streamlit Secrets (Streamlit Cloud)
     try:
         import streamlit as st
-        token = st.secrets.get("ML_ACCESS_TOKEN")
-        if token:
-            return token
+        if hasattr(st, 'secrets'):
+            token = st.secrets.get("ML_ACCESS_TOKEN", None)
+            if token:
+                return token
     except Exception:
         pass
 
+    # 2. Leer desde archivo local
     tokens = _load_tokens()
 
     if not tokens:
@@ -126,29 +96,22 @@ def get_valid_access_token() -> str:
         )
 
     # Verificar si el token está por vencer
-    obtained_at   = tokens.get("obtained_at", 0)
-    expires_in    = tokens.get("expires_in", 21600)  # 6hs por defecto
-    time_elapsed  = time.time() - obtained_at
+    obtained_at    = tokens.get("obtained_at", 0)
+    expires_in     = tokens.get("expires_in", 21600)
+    time_elapsed   = time.time() - obtained_at
     time_remaining = expires_in - time_elapsed
 
-    if time_remaining < 300:  # menos de 5 minutos → renovar
+    if time_remaining < 300:
         print(f"⚠️  Token vence en {int(time_remaining)}s. Renovando...")
         tokens = refresh_access_token(tokens["refresh_token"])
 
     return tokens["access_token"]
 
 
-# ─── CLI: Flujo de autorización inicial ──────────────────────────
-
 def authorize_interactive():
-    """
-    Flujo interactivo para autorizar la app por primera vez.
-    Ejecutá: python auth/ml_auth.py
-    """
     print("\n🔐 Autorización de Mercado Libre")
     print("=" * 40)
 
-    # Verificar si ya hay tokens
     tokens = _load_tokens()
     if tokens:
         print("✅ Ya tenés tokens guardados.")
@@ -167,7 +130,7 @@ def authorize_interactive():
         print("   (No se pudo abrir el navegador automáticamente)")
 
     print("2. Después de autorizar, ML te redirige a una URL como:")
-    print("   https://localhost?code=TU_CODIGO_AQUI\n")
+    print("   https://www.google.com?code=TU_CODIGO_AQUI\n")
 
     code = input("3. Pegá el valor del parámetro 'code' aquí: ").strip()
 
