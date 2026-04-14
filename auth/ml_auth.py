@@ -80,10 +80,9 @@ def get_valid_access_token() -> str:
     # 1. Intentar leer desde Streamlit Secrets (Streamlit Cloud)
     try:
         import streamlit as st
-        if hasattr(st, 'secrets'):
-            token = st.secrets.get("ML_ACCESS_TOKEN", None)
-            if token:
-                return token
+        token = st.secrets["ML_ACCESS_TOKEN"]
+        if token:
+            return token
     except Exception:
         pass
 
