@@ -26,7 +26,10 @@ def _load_tokens() -> dict:
 
 
 def _save_tokens(tokens: dict) -> None:
-    Path(TOKENS_LOCAL_PATH).write_text(json.dumps(tokens, indent=2))
+    try:
+        Path(TOKENS_LOCAL_PATH).write_text(json.dumps(tokens, indent=2))
+    except Exception:
+        pass  # En Streamlit Cloud no se puede escribir archivos
 
 
 def get_auth_url() -> str:
@@ -67,22 +70,31 @@ def refresh_access_token(refresh_token: str) -> dict:
     tokens = resp.json()
     tokens["obtained_at"] = time.time()
     _save_tokens(tokens)
-    print("🔄 Access token renovado.")
     return tokens
 
 
 def get_valid_access_token() -> str:
     """
     Retorna un access_token vigente.
-    En Streamlit Cloud lee el token desde los secrets.
+    En Streamlit Cloud usa el refresh token para obtener uno nuevo.
     En local usa el archivo .tokens.json con auto-refresh.
     """
-    # 1. Intentar leer desde Streamlit Secrets (Streamlit Cloud)
+    # 1. Intentar usar refresh token desde Streamlit Secrets
     try:
         import streamlit as st
-        token = st.secrets["ML_ACCESS_TOKEN"]
-        if token:
-            return token
+        ml_refresh = st.secrets["ML_REFRESH_TOKEN"]
+        ml_app_id  = st.secrets["ML_APP_ID"]
+        ml_secret  = st.secrets["ML_SECRET_KEY"]
+        if ml_refresh and ml_app_id and ml_secret:
+            payload = {
+                "grant_type":    "refresh_token",
+                "client_id":     ml_app_id,
+                "client_secret": ml_secret,
+                "refresh_token": ml_refresh,
+            }
+            resp = requests.post(ML_TOKEN_URL, data=payload)
+            if resp.status_code == 200:
+                return resp.json()["access_token"]
     except Exception:
         pass
 
@@ -94,14 +106,12 @@ def get_valid_access_token() -> str:
             "No hay tokens guardados. Ejecutá `python auth/ml_auth.py` para autorizarte."
         )
 
-    # Verificar si el token está por vencer
     obtained_at    = tokens.get("obtained_at", 0)
     expires_in     = tokens.get("expires_in", 21600)
     time_elapsed   = time.time() - obtained_at
     time_remaining = expires_in - time_elapsed
 
     if time_remaining < 300:
-        print(f"⚠️  Token vence en {int(time_remaining)}s. Renovando...")
         tokens = refresh_access_token(tokens["refresh_token"])
 
     return tokens["access_token"]
