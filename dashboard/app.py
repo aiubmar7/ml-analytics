@@ -76,6 +76,82 @@ st.sidebar.markdown(f"*Período: últimos {days_back} días*")
 def fmt_currency(value: float, currency: str = "UYU") -> str:
     return f"${value:,.0f} {currency}"
 
+def show_period_detail(summary: dict, label: str):
+    if summary["revenue"] == 0:
+        st.warning(f"Sin datos para {label}. Cargá el historial desde 🗄️ Historial.")
+        return
+    df = summary["df"]
+    if df.empty:
+        return
+
+    st.markdown(f"##### {label}")
+    k1, k2, k3, k4, k5 = st.columns(5)
+    k1.metric("Facturación", fmt_currency(summary["revenue"]))
+    k2.metric("Neto", fmt_currency(summary["net"]))
+    k3.metric("Órdenes", f"{summary['orders']:,}")
+    k4.metric("Unidades", f"{summary['units']:,}")
+    k5.metric("Ticket prom.", fmt_currency(summary["avg_ticket"]))
+
+    tab_un, tab_din, tab_pareto = st.tabs(["📦 Top 10 por unidades", "💰 Top 10 por facturación", "📊 Pareto"])
+
+    with tab_un:
+        top_units = (
+            df.groupby("item_title")["quantity"].sum()
+            .sort_values(ascending=False).head(10)
+            .reset_index().rename(columns={"item_title": "Producto", "quantity": "Unidades"})
+        )
+        fig = px.bar(top_units, x="Unidades", y="Producto", orientation="h",
+                     color_discrete_sequence=["#3483FA"])
+        fig.update_layout(plot_bgcolor="rgba(0,0,0,0)", yaxis={"categoryorder": "total ascending"})
+        st.plotly_chart(fig, use_container_width=True)
+
+    with tab_din:
+        top_rev = (
+            df.groupby("item_title")["total_amount"].sum()
+            .sort_values(ascending=False).head(10)
+            .reset_index().rename(columns={"item_title": "Producto", "total_amount": "Facturación"})
+        )
+        fig2 = px.bar(top_rev, x="Facturación", y="Producto", orientation="h",
+                      color_discrete_sequence=["#FFE600"])
+        fig2.update_layout(plot_bgcolor="rgba(0,0,0,0)", yaxis={"categoryorder": "total ascending"})
+        st.plotly_chart(fig2, use_container_width=True)
+
+    with tab_pareto:
+        pareto = (
+            df.groupby("item_title")["total_amount"].sum()
+            .sort_values(ascending=False).reset_index()
+        )
+        pareto["acumulado"]     = pareto["total_amount"].cumsum()
+        pareto["pct_acumulado"] = pareto["acumulado"] / pareto["total_amount"].sum() * 100
+        pareto["rank"]          = range(1, len(pareto) + 1)
+
+        corte_80       = pareto[pareto["pct_acumulado"] <= 80]
+        n_productos_80 = len(corte_80)
+        pct_prod_80    = round(n_productos_80 / len(pareto) * 100, 1)
+
+        st.info(f"**{n_productos_80} productos** ({pct_prod_80}% del catálogo) generan el **80% de los ingresos**")
+
+        fig3 = px.bar(pareto.head(20), x="item_title", y="total_amount",
+                      title="Pareto — Top 20 productos",
+                      labels={"item_title": "Producto", "total_amount": "Facturación"},
+                      color_discrete_sequence=["#3483FA"])
+        fig3.add_scatter(x=pareto.head(20)["item_title"], y=pareto.head(20)["pct_acumulado"],
+                         mode="lines+markers", name="% Acumulado", yaxis="y2",
+                         line=dict(color="#FFE600", width=2))
+        fig3.update_layout(
+            plot_bgcolor="rgba(0,0,0,0)",
+            xaxis_tickangle=-45,
+            yaxis2=dict(title="% Acumulado", overlaying="y", side="right", range=[0, 105]),
+        )
+        st.plotly_chart(fig3, use_container_width=True)
+
+        st.dataframe(
+            pareto[["rank", "item_title", "total_amount", "pct_acumulado"]].head(20)
+            .rename(columns={"rank": "#", "item_title": "Producto", "total_amount": "Facturación", "pct_acumulado": "% Acumulado"})
+            .assign(Facturación=lambda x: x["Facturación"].apply(fmt_currency)),
+            use_container_width=True, hide_index=True
+        )
+
 # ══════════════════════════════════════════════════════════════════
 # PÁGINA: RESUMEN
 # ══════════════════════════════════════════════════════════════════
@@ -278,7 +354,7 @@ elif page == "📊 Reportes":
         mes_prev_inicio   = date(prev_year, prev_month, 1)
         mes_prev_fin      = date(prev_year, prev_month, prev_days)
 
-        with st.spinner("Cargando datos de ambos meses..."):
+        with st.spinner("Cargando datos..."):
             try:
                 actual = clients["sales"].get_period_summary(mes_actual_inicio, mes_actual_fin)
                 prev   = clients["sales"].get_period_summary(mes_prev_inicio, mes_prev_fin)
@@ -309,12 +385,12 @@ elif page == "📊 Reportes":
                           color_discrete_sequence=["#3483FA", "#FFE600"])
             st.plotly_chart(fig, use_container_width=True)
 
-        resumen = pd.DataFrame({
-            "Métrica": ["Ingresos brutos", "Ingresos netos", "Órdenes", "Unidades", "Ticket promedio"],
-            mes_actual_inicio.strftime("%B %Y"): [fmt_currency(actual["revenue"]), fmt_currency(actual["net"]), actual["orders"], actual["units"], fmt_currency(actual["avg_ticket"])],
-            mes_prev_inicio.strftime("%B %Y"):   [fmt_currency(prev["revenue"]),   fmt_currency(prev["net"]),   prev["orders"],   prev["units"],   fmt_currency(prev["avg_ticket"])],
-        })
-        st.dataframe(resumen, use_container_width=True, hide_index=True)
+        st.markdown("---")
+        col_a, col_b = st.columns(2)
+        with col_a:
+            show_period_detail(actual, mes_actual_inicio.strftime("%B %Y"))
+        with col_b:
+            show_period_detail(prev, mes_prev_inicio.strftime("%B %Y"))
 
     elif tipo == "📆 Mes actual vs mismo mes año pasado":
         st.subheader("Mes actual vs mismo mes del año pasado")
@@ -340,14 +416,14 @@ elif page == "📊 Reportes":
         c4.metric("Unidades", f"{actual['units']:,}", delta=delta_pct(actual["units"], ly["units"]))
 
         if ly["revenue"] == 0:
-            st.warning("No hay datos del año pasado en la API. Cargá el historial desde el módulo 🗄️ Historial.")
+            st.warning("No hay datos del año pasado. Cargá el historial desde 🗄️ Historial.")
 
-        resumen = pd.DataFrame({
-            "Métrica": ["Ingresos brutos", "Ingresos netos", "Órdenes", "Unidades", "Ticket promedio"],
-            mes_actual_inicio.strftime("%B %Y"): [fmt_currency(actual["revenue"]), fmt_currency(actual["net"]), actual["orders"], actual["units"], fmt_currency(actual["avg_ticket"])],
-            ly_inicio.strftime("%B %Y"):         [fmt_currency(ly["revenue"]),     fmt_currency(ly["net"]),     ly["orders"],     ly["units"],     fmt_currency(ly["avg_ticket"])],
-        })
-        st.dataframe(resumen, use_container_width=True, hide_index=True)
+        st.markdown("---")
+        col_a, col_b = st.columns(2)
+        with col_a:
+            show_period_detail(actual, mes_actual_inicio.strftime("%B %Y"))
+        with col_b:
+            show_period_detail(ly, ly_inicio.strftime("%B %Y"))
 
     elif tipo == "🗓️ Rango personalizado":
         st.subheader("Comparar dos períodos personalizados")
@@ -386,7 +462,9 @@ elif page == "📊 Reportes":
                     df_all["date"] = df_all["date_created"].dt.date
                     df_filtered = df_all[(df_all["date"] >= date_from) & (df_all["date"] <= date_to)]
                     if not df_filtered.empty:
-                        df_paid = df_filtered[df_filtered["status"] == "paid"]
+                        df_paid = df_filtered[df_filtered["status"] == "paid"].copy()
+                        if "net_amount" not in df_paid.columns:
+                            df_paid["net_amount"] = df_paid["total_amount"] - df_paid.get("sale_fee", 0)
                         return {
                             "revenue":    round(float(df_paid["total_amount"].sum()), 2),
                             "net":        round(float(df_paid["net_amount"].sum()), 2),
@@ -418,23 +496,25 @@ elif page == "📊 Reportes":
             if not periodo_a["df"].empty and not periodo_b["df"].empty:
                 df_a = periodo_a["df"].copy()
                 df_b = periodo_b["df"].copy()
-                df_a["periodo"] = label_a
-                df_b["periodo"] = label_b
-                df_all = pd.concat([df_a, df_b])
-                df_all["fecha"] = df_all["date_created"].dt.date
-                daily_all = df_all.groupby(["fecha", "periodo"])["total_amount"].sum().reset_index()
-                fig = px.line(daily_all, x="fecha", y="total_amount", color="periodo",
-                              title="Facturación diaria comparada",
-                              labels={"fecha": "Fecha", "total_amount": "Ingresos", "periodo": "Período"},
-                              color_discrete_sequence=["#3483FA", "#FFE600"])
+                df_a["dia"] = (pd.to_datetime(df_a["date_created"]) - pd.Timestamp(a_desde)).dt.days + 1
+                df_b["dia"] = (pd.to_datetime(df_b["date_created"]) - pd.Timestamp(b_desde)).dt.days + 1
+                daily_a = df_a.groupby("dia")["total_amount"].sum().reset_index()
+                daily_b = df_b.groupby("dia")["total_amount"].sum().reset_index()
+                daily_a["periodo"] = label_a
+                daily_b["periodo"] = label_b
+                df_chart = pd.concat([daily_a, daily_b])
+                fig = px.line(df_chart, x="dia", y="total_amount", color="periodo",
+                              title="Facturación por día del período",
+                              labels={"dia": "Día del período", "total_amount": "Ingresos", "periodo": "Período"},
+                              color_discrete_sequence=["#FFE600", "#3483FA"])
                 st.plotly_chart(fig, use_container_width=True)
 
-            resumen = pd.DataFrame({
-                "Métrica": ["Ingresos brutos", "Ingresos netos", "Órdenes", "Unidades", "Ticket promedio"],
-                label_a: [fmt_currency(periodo_a["revenue"]), fmt_currency(periodo_a["net"]), periodo_a["orders"], periodo_a["units"], fmt_currency(periodo_a["avg_ticket"])],
-                label_b: [fmt_currency(periodo_b["revenue"]), fmt_currency(periodo_b["net"]), periodo_b["orders"], periodo_b["units"], fmt_currency(periodo_b["avg_ticket"])],
-            })
-            st.dataframe(resumen, use_container_width=True, hide_index=True)
+            st.markdown("---")
+            col_det_a, col_det_b = st.columns(2)
+            with col_det_a:
+                show_period_detail(periodo_a, label_a)
+            with col_det_b:
+                show_period_detail(periodo_b, label_b)
 
 
 # ══════════════════════════════════════════════════════════════════
