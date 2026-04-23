@@ -1,545 +1,778 @@
-import os
-import re
-import time
-import hmac
-import base64
-import hashlib
-import requests
-import pdfplumber
+"""
+Dashboard principal - Streamlit.
+"""
+
+import sys
+import logging
+from pathlib import Path
+from datetime import datetime, date
+import calendar
+
+import sys as _sys
+from pathlib import Path as _Path
+_ROOT = _Path(__file__).resolve().parent.parent
+if str(_ROOT) not in _sys.path:
+    _sys.path.insert(0, str(_ROOT))
+
+import streamlit as st
 import pandas as pd
-import unicodedata
-from flask import Flask, request, jsonify
-from io import BytesIO
+import plotly.express as px
+import plotly.graph_objects as go
+from auth.ml_auth import get_valid_access_token
+from auth.ml_client import MLClient
+from extractors.my_sales import MySalesExtractor
+from extractors.competition import CompetitionExtractor
+from extractors.competitor_tracker import CompetitorTracker
+from extractors.categories import CategoriesExtractor
+from extractors.keywords import KeywordsExtractor
+from storage.dropbox_client import DropboxClient
 
-app = Flask(__name__)
+logging.basicConfig(level=logging.INFO)
 
-DROPBOX_APP_SECRET     = os.environ["DROPBOX_APP_SECRET"]
-DROPBOX_REFRESH_TOKEN  = os.environ.get("DROPBOX_REFRESH_TOKEN", "")
-DROPBOX_APP_KEY        = os.environ["DROPBOX_APP_KEY"]
-ML_CLIENT_ID           = os.environ["ML_CLIENT_ID"]
-ML_CLIENT_SECRET       = os.environ["ML_CLIENT_SECRET"]
-ML_REFRESH_TOKEN       = os.environ["ML_REFRESH_TOKEN"]
+st.set_page_config(
+    page_title="ML Analytics",
+    page_icon="📊",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
-CARPETA_ENTRADA    = "/facturas compartidas ML"
-CARPETA_PROCESADOS = "/facturas compartidas ML/procesados"
+st.markdown("""
+<style>
+@import url('https://fonts.cdnfonts.com/css/samsung-sans');
+html, body, [class*="css"], p, div, span, label, input, button {
+    font-family: 'Samsung Sans', sans-serif !important;
+    font-size: 14px !important;
+}
+h1 { font-size: 24px !important; }
+h2 { font-size: 20px !important; }
+h3 { font-size: 17px !important; }
+[data-testid="metric-container"] label { font-size: 13px !important; }
+[data-testid="metric-container"] [data-testid="stMetricValue"] { font-size: 20px !important; }
+</style>
+""", unsafe_allow_html=True)
+
+@st.cache_resource
+def get_clients():
+    return {
+        "sales":       MySalesExtractor(),
+        "competition": CompetitionExtractor(),
+        "categories":  CategoriesExtractor(),
+        "keywords":    KeywordsExtractor(),
+        "storage":     DropboxClient(),
+    }
+
+st.sidebar.title("📊 ML Analytics")
+st.sidebar.markdown("---")
+
+page = st.sidebar.radio(
+    "Módulo",
+    ["🏠 Resumen", "💰 Mis Ventas", "📊 Reportes", "🗄️ Historial", "🔍 Competencia", "📈 Tendencias", "🔑 Keywords"],
+)
+
+st.sidebar.markdown("---")
+days_back = st.sidebar.slider("Días a analizar", 7, 90, 30)
+st.sidebar.markdown(f"*Período: últimos {days_back} días*")
+
+def fmt_currency(value: float, currency: str = "UYU") -> str:
+    return f"${value:,.0f} {currency}"
+
+def show_period_detail(summary: dict, label: str):
+    if summary["revenue"] == 0:
+        st.warning(f"Sin datos para {label}. Cargá el historial desde 🗄️ Historial.")
+        return
+    df = summary["df"]
+    if df.empty:
+        return
+
+    st.markdown(f"##### {label}")
+    k1, k2, k3, k4, k5 = st.columns(5)
+    k1.metric("Facturación", fmt_currency(summary["revenue"]))
+    k2.metric("Neto", fmt_currency(summary["net"]))
+    k3.metric("Órdenes", f"{summary['orders']:,}")
+    k4.metric("Unidades", f"{summary['units']:,}")
+    k5.metric("Ticket prom.", fmt_currency(summary["avg_ticket"]))
+
+    tab_un, tab_din, tab_pareto = st.tabs(["📦 Top 10 por unidades", "💰 Top 10 por facturación", "📊 Pareto"])
+
+    with tab_un:
+        top_units = (
+            df.groupby("item_title")["quantity"].sum()
+            .sort_values(ascending=False).head(10)
+            .reset_index().rename(columns={"item_title": "Producto", "quantity": "Unidades"})
+        )
+        fig = px.bar(top_units, x="Unidades", y="Producto", orientation="h",
+                     color_discrete_sequence=["#3483FA"])
+        fig.update_layout(plot_bgcolor="rgba(0,0,0,0)", yaxis={"categoryorder": "total ascending"})
+        st.plotly_chart(fig, use_container_width=True)
+
+    with tab_din:
+        top_rev = (
+            df.groupby("item_title")["total_amount"].sum()
+            .sort_values(ascending=False).head(10)
+            .reset_index().rename(columns={"item_title": "Producto", "total_amount": "Facturación"})
+        )
+        fig2 = px.bar(top_rev, x="Facturación", y="Producto", orientation="h",
+                      color_discrete_sequence=["#FFE600"])
+        fig2.update_layout(plot_bgcolor="rgba(0,0,0,0)", yaxis={"categoryorder": "total ascending"})
+        st.plotly_chart(fig2, use_container_width=True)
+
+    with tab_pareto:
+        pareto = (
+            df.groupby("item_title")["total_amount"].sum()
+            .sort_values(ascending=False).reset_index()
+        )
+        pareto["acumulado"]     = pareto["total_amount"].cumsum()
+        pareto["pct_acumulado"] = pareto["acumulado"] / pareto["total_amount"].sum() * 100
+        pareto["rank"]          = range(1, len(pareto) + 1)
+
+        corte_80       = pareto[pareto["pct_acumulado"] <= 80]
+        n_productos_80 = len(corte_80)
+        pct_prod_80    = round(n_productos_80 / len(pareto) * 100, 1)
+
+        st.info(f"**{n_productos_80} productos** ({pct_prod_80}% del catálogo) generan el **80% de los ingresos**")
+
+        fig3 = px.bar(pareto.head(20), x="item_title", y="total_amount",
+                      title="Pareto — Top 20 productos",
+                      labels={"item_title": "Producto", "total_amount": "Facturación"},
+                      color_discrete_sequence=["#3483FA"])
+        fig3.add_scatter(x=pareto.head(20)["item_title"], y=pareto.head(20)["pct_acumulado"],
+                         mode="lines+markers", name="% Acumulado", yaxis="y2",
+                         line=dict(color="#FFE600", width=2))
+        fig3.update_layout(
+            plot_bgcolor="rgba(0,0,0,0)",
+            xaxis_tickangle=-45,
+            yaxis2=dict(title="% Acumulado", overlaying="y", side="right", range=[0, 105]),
+        )
+        st.plotly_chart(fig3, use_container_width=True)
+
+        st.dataframe(
+            pareto[["rank", "item_title", "total_amount", "pct_acumulado"]].head(20)
+            .rename(columns={"rank": "#", "item_title": "Producto", "total_amount": "Facturación", "pct_acumulado": "% Acumulado"})
+            .assign(Facturación=lambda x: x["Facturación"].apply(fmt_currency)),
+            use_container_width=True, hide_index=True
+        )
+
+# ══════════════════════════════════════════════════════════════════
+# PÁGINA: RESUMEN
+# ══════════════════════════════════════════════════════════════════
+
+if page == "🏠 Resumen":
+    st.title("🏠 Resumen Ejecutivo")
+    clients = get_clients()
+
+    with st.spinner("Cargando datos..."):
+        try:
+            summary = clients["sales"].get_summary(days_back)
+        except Exception as e:
+            st.error(f"Error al cargar datos: {e}")
+            st.info("Asegurate de haber completado la autorización (`python auth/ml_auth.py`)")
+            st.stop()
+
+    if "error" in summary:
+        st.warning(summary["error"])
+        st.stop()
+
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("Órdenes", summary["total_orders"])
+    with col2:
+        st.metric("Unidades vendidas", summary["total_units"])
+    with col3:
+        st.metric("Ingresos brutos", fmt_currency(summary["total_revenue"]))
+    with col4:
+        st.metric("Ingresos netos", fmt_currency(summary["net_revenue"]))
+
+    st.markdown("---")
+    col_left, col_right = st.columns(2)
+
+    with col_left:
+        st.subheader("Reputación")
+        rep = summary.get("reputation", {})
+        st.metric("Nivel", rep.get("level_id", "—").replace("_", " ").title())
+        st.metric("Power Seller", rep.get("power_seller_status", "—"))
+        claims_rate = rep.get("claims_rate", 0) * 100
+        color = "🟢" if claims_rate < 2 else "🟡" if claims_rate < 5 else "🔴"
+        st.metric(f"Tasa de reclamos {color}", f"{claims_rate:.2f}%")
+
+    with col_right:
+        st.subheader("Producto estrella")
+        if summary.get("top_item"):
+            st.info(f"**{summary['top_item']}**")
+        st.metric("Ticket promedio", fmt_currency(summary.get("avg_ticket", 0)))
+
+    st.markdown("---")
+    st.subheader("📅 Pronóstico de facturación mensual")
+
+    with st.spinner("Calculando pronóstico..."):
+        try:
+            forecast = clients["sales"].get_monthly_forecast()
+        except Exception as e:
+            forecast = {"error": str(e)}
+
+    if "error" in forecast:
+        st.warning(f"No se pudo calcular el pronóstico: {forecast['error']}")
+    else:
+        elapsed    = forecast["days_elapsed"]
+        remaining  = forecast["days_remaining"]
+        total_days = forecast["days_in_month"]
+
+        st.caption(f"📆 {forecast['month']} — día {elapsed} de {total_days} ({remaining} días restantes)")
+        st.progress(elapsed / total_days, text=f"Progreso del mes: {elapsed}/{total_days} días")
+
+        st.markdown("#### Proyección final del mes")
+        fc1, fc2, fc3, fc4 = st.columns(4)
+        with fc1:
+            delta_rev = f"{forecast['vs_prev_month_pct']:+.1f}% vs mes ant." if forecast.get("vs_prev_month_pct") is not None else None
+            st.metric("💰 Facturación proyectada", fmt_currency(forecast["forecast_revenue"]), delta=delta_rev)
+        with fc2:
+            st.metric("📦 Unidades proyectadas", f"{int(forecast['forecast_units']):,}")
+        with fc3:
+            st.metric("🛒 Órdenes proyectadas", f"{int(forecast['forecast_orders']):,}")
+        with fc4:
+            st.metric("💵 Neto proyectado", fmt_currency(forecast["forecast_net"]))
+
+        st.markdown("#### Acumulado real vs proyección")
+        ac1, ac2, ac3 = st.columns(3)
+        with ac1:
+            pct_done = round(forecast["revenue_so_far"] / forecast["forecast_revenue"] * 100, 1) if forecast["forecast_revenue"] > 0 else 0
+            st.metric("Facturado hasta hoy", fmt_currency(forecast["revenue_so_far"]), delta=f"{pct_done}% del objetivo")
+        with ac2:
+            st.metric("Promedio diario (mes)", fmt_currency(forecast["daily_avg_revenue"]))
+        with ac3:
+            st.metric("Promedio diario (últ. 7d)", fmt_currency(forecast["daily_trend_revenue"]))
+
+        with st.expander("🔍 Detalle del cálculo (5 factores)"):
+            d1, d2, d3 = st.columns(3)
+            with d1:
+                st.metric("1️⃣ Promedio diario del mes", fmt_currency(forecast["proj_daily_avg"]), help="Peso: 25%")
+            with d2:
+                st.metric("2️⃣ Tendencia últimos 7 días", fmt_currency(forecast["proj_trend_7d"]), help="Peso: 30%")
+            with d3:
+                ly = forecast.get("last_year_revenue")
+                st.metric("3️⃣ Mismo mes año anterior", fmt_currency(ly) if ly else "Sin datos", help="Peso: 20%")
+            d4, d5 = st.columns(2)
+            with d4:
+                seasonal = forecast.get("proj_seasonal")
+                yrs = forecast.get("seasonal_years", 0)
+                label = f"4️⃣ Estacionalidad ({yrs} años)" if yrs > 0 else "4️⃣ Estacionalidad histórica"
+                st.metric(label, fmt_currency(seasonal) if seasonal else "Sin datos", help="Peso: 15%")
+            with d5:
+                acc = forecast.get("acceleration_factor", 1.0)
+                arrow = "📈" if acc > 1 else "📉" if acc < 1 else "➡️"
+                st.metric("5️⃣ Velocidad de crecimiento", fmt_currency(forecast.get("proj_acceleration", 0)),
+                          delta=f"{arrow} Factor: {acc:.2f}x", help="Peso: 10%")
+            if forecast.get("vs_last_year_pct") is not None:
+                st.info(f"📊 Crecimiento vs mismo mes del año anterior: **{forecast['vs_last_year_pct']:+.1f}%**")
 
 
-def get_dropbox_token():
-    token = os.environ.get("DROPBOX_ACCESS_TOKEN", "").strip()
-    if token:
-        return token
-    r = requests.post("https://api.dropbox.com/oauth2/token", data={
-        "grant_type":    "refresh_token",
-        "refresh_token": DROPBOX_REFRESH_TOKEN,
-        "client_id":     DROPBOX_APP_KEY,
-        "client_secret": DROPBOX_APP_SECRET,
-    })
-    data = r.json()
-    if "access_token" not in data:
-        raise Exception(f"Dropbox error: {data}")
-    return data["access_token"]
+# ══════════════════════════════════════════════════════════════════
+# PÁGINA: MIS VENTAS
+# ══════════════════════════════════════════════════════════════════
 
+elif page == "💰 Mis Ventas":
+    st.title("💰 Mis Ventas")
+    clients = get_clients()
 
-def listar_pdfs_nuevos(token):
-    r = requests.post(
-        "https://api.dropboxapi.com/2/files/list_folder",
-        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-        json={"path": CARPETA_ENTRADA, "recursive": False}
+    col_btn1, _ = st.columns([1, 4])
+    with col_btn1:
+        refresh = st.button("🔄 Actualizar datos")
+
+    with st.spinner("Extrayendo órdenes de ML..."):
+        if refresh:
+            df = clients["sales"].sync_orders(days_back)
+        else:
+            month_str = datetime.now().strftime("%Y-%m")
+            df = clients["storage"].load_dataframe(f"data/my_sales/orders_{month_str}.parquet")
+            if df is None:
+                df = clients["sales"].sync_orders(days_back)
+
+    if df is None or df.empty:
+        st.warning("No hay datos de ventas disponibles.")
+        st.stop()
+
+    df_paid = df[df["status"] == "paid"].copy()
+
+    st.subheader("Ventas diarias")
+    df_paid["date"] = df_paid["date_created"].dt.date
+    daily = df_paid.groupby("date").agg(
+        total_amount=("total_amount", "sum"),
+        orders=("order_id", "nunique"),
+    ).reset_index()
+
+    fig = px.bar(daily, x="date", y="total_amount",
+                 labels={"date": "Fecha", "total_amount": "Ingresos"},
+                 color_discrete_sequence=["#FFE600"])
+    fig.update_layout(plot_bgcolor="rgba(0,0,0,0)")
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.subheader("Top productos por ingresos")
+    top_items = (
+        df_paid.groupby("item_title")
+        .agg(total=("total_amount", "sum"), units=("quantity", "sum"))
+        .sort_values("total", ascending=False)
+        .head(10)
+        .reset_index()
     )
-    archivos = r.json().get("entries", [])
-    return [a for a in archivos if a[".tag"] == "file" and a["name"].endswith(".pdf")]
+    fig2 = px.bar(top_items, x="total", y="item_title", orientation="h",
+                  labels={"total": "Ingresos", "item_title": "Producto"},
+                  color_discrete_sequence=["#3483FA"])
+    fig2.update_layout(plot_bgcolor="rgba(0,0,0,0)")
+    st.plotly_chart(fig2, use_container_width=True)
+
+    with st.expander("📋 Ver datos completos"):
+        st.dataframe(df_paid, use_container_width=True)
 
 
-def descargar_pdf(token, path):
-    r = requests.post(
-        "https://content.dropboxapi.com/2/files/download",
-        headers={
-            "Authorization":   f"Bearer {token}",
-            "Dropbox-API-Arg": f'{{"path": "{path}"}}'
-        }
-    )
-    return r.content
+# ══════════════════════════════════════════════════════════════════
+# PÁGINA: REPORTES Y COMPARACIONES
+# ══════════════════════════════════════════════════════════════════
 
+elif page == "📊 Reportes":
+    st.title("📊 Reportes y Comparaciones")
+    clients = get_clients()
 
-def mover_a_procesados(token, path, nombre):
-    requests.post(
-        "https://api.dropboxapi.com/2/files/move_v2",
-        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-        json={
-            "from_path": path,
-            "to_path":   f"{CARPETA_PROCESADOS}/{nombre}",
-            "autorename": True
-        }
+    tipo = st.radio(
+        "Tipo de comparación",
+        ["📅 Mes actual vs mes anterior", "📆 Mes actual vs mismo mes año pasado", "🗓️ Rango personalizado"],
+        horizontal=True,
     )
 
+    today = date.today()
 
-def get_ml_token():
-    r = requests.post("https://api.mercadolibre.com/oauth/token", data={
-        "grant_type":    "refresh_token",
-        "client_id":     ML_CLIENT_ID,
-        "client_secret": ML_CLIENT_SECRET,
-        "refresh_token": ML_REFRESH_TOKEN,
-    })
-    return r.json()["access_token"]
-
-
-def extraer_order_id(pdf_bytes):
-    try:
-        with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
-            texto = "\n".join(p.extract_text() or "" for p in pdf.pages)
-        match = re.search(r'ML#(\d+)', texto)
-        return match.group(1) if match else None
-    except Exception as e:
-        print(f"  Error leyendo PDF: {e}")
+    def delta_pct(actual, prev):
+        if prev and prev > 0:
+            return f"{((actual - prev) / prev * 100):+.1f}%"
         return None
 
+    if tipo == "📅 Mes actual vs mes anterior":
+        st.subheader("Mes actual vs mes anterior")
+        mes_actual_inicio = date(today.year, today.month, 1)
+        mes_actual_fin    = today
+        prev_month        = today.month - 1 if today.month > 1 else 12
+        prev_year         = today.year if today.month > 1 else today.year - 1
+        prev_days         = calendar.monthrange(prev_year, prev_month)[1]
+        mes_prev_inicio   = date(prev_year, prev_month, 1)
+        mes_prev_fin      = date(prev_year, prev_month, prev_days)
 
-def obtener_pack_id(token, order_id):
-    r = requests.get(
-        f"https://api.mercadolibre.com/orders/{order_id}",
-        headers={"Authorization": f"Bearer {token}"}
-    )
-    data = r.json()
-    pack_id = data.get("pack_id")
-    return str(pack_id) if pack_id else order_id
+        with st.spinner("Cargando datos..."):
+            try:
+                actual = clients["sales"].get_period_summary(mes_actual_inicio, mes_actual_fin)
+                prev   = clients["sales"].get_period_summary(mes_prev_inicio, mes_prev_fin)
+            except Exception as e:
+                st.error(f"Error: {e}")
+                st.stop()
+
+        st.markdown(f"#### {mes_actual_inicio.strftime('%B %Y')} vs {mes_prev_inicio.strftime('%B %Y')}")
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Ingresos brutos", fmt_currency(actual["revenue"]), delta=delta_pct(actual["revenue"], prev["revenue"]))
+        c2.metric("Ingresos netos", fmt_currency(actual["net"]), delta=delta_pct(actual["net"], prev["net"]))
+        c3.metric("Órdenes", f"{actual['orders']:,}", delta=delta_pct(actual["orders"], prev["orders"]))
+        c4.metric("Unidades", f"{actual['units']:,}", delta=delta_pct(actual["units"], prev["units"]))
+
+        if not actual["df"].empty and not prev["df"].empty:
+            df_act = actual["df"].copy()
+            df_prv = prev["df"].copy()
+            df_act["dia"] = df_act["date_created"].dt.day
+            df_prv["dia"] = df_prv["date_created"].dt.day
+            daily_act = df_act.groupby("dia")["total_amount"].sum().reset_index()
+            daily_prv = df_prv.groupby("dia")["total_amount"].sum().reset_index()
+            daily_act["mes"] = mes_actual_inicio.strftime("%B %Y")
+            daily_prv["mes"] = mes_prev_inicio.strftime("%B %Y")
+            df_chart = pd.concat([daily_act, daily_prv])
+            fig = px.line(df_chart, x="dia", y="total_amount", color="mes",
+                          title="Facturación diaria comparada",
+                          labels={"dia": "Día del mes", "total_amount": "Ingresos", "mes": "Mes"},
+                          color_discrete_sequence=["#3483FA", "#FFE600"])
+            st.plotly_chart(fig, use_container_width=True)
+
+        st.markdown("---")
+        col_a, col_b = st.columns(2)
+        with col_a:
+            show_period_detail(actual, mes_actual_inicio.strftime("%B %Y"))
+        with col_b:
+            show_period_detail(prev, mes_prev_inicio.strftime("%B %Y"))
+
+    elif tipo == "📆 Mes actual vs mismo mes año pasado":
+        st.subheader("Mes actual vs mismo mes del año pasado")
+        mes_actual_inicio = date(today.year, today.month, 1)
+        mes_actual_fin    = today
+        ly_inicio         = date(today.year - 1, today.month, 1)
+        ly_dias           = calendar.monthrange(today.year - 1, today.month)[1]
+        ly_fin            = date(today.year - 1, today.month, ly_dias)
+
+        with st.spinner("Cargando datos..."):
+            try:
+                actual = clients["sales"].get_period_summary(mes_actual_inicio, mes_actual_fin)
+                ly     = clients["sales"].get_period_summary(ly_inicio, ly_fin)
+            except Exception as e:
+                st.error(f"Error: {e}")
+                st.stop()
+
+        st.markdown(f"#### {mes_actual_inicio.strftime('%B %Y')} vs {ly_inicio.strftime('%B %Y')}")
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Ingresos brutos", fmt_currency(actual["revenue"]), delta=delta_pct(actual["revenue"], ly["revenue"]))
+        c2.metric("Ingresos netos", fmt_currency(actual["net"]), delta=delta_pct(actual["net"], ly["net"]))
+        c3.metric("Órdenes", f"{actual['orders']:,}", delta=delta_pct(actual["orders"], ly["orders"]))
+        c4.metric("Unidades", f"{actual['units']:,}", delta=delta_pct(actual["units"], ly["units"]))
+
+        if ly["revenue"] == 0:
+            st.warning("No hay datos del año pasado. Cargá el historial desde 🗄️ Historial.")
+
+        st.markdown("---")
+        col_a, col_b = st.columns(2)
+        with col_a:
+            show_period_detail(actual, mes_actual_inicio.strftime("%B %Y"))
+        with col_b:
+            show_period_detail(ly, ly_inicio.strftime("%B %Y"))
+
+    elif tipo == "🗓️ Rango personalizado":
+        st.subheader("Comparar dos períodos personalizados")
+        col_a, col_b = st.columns(2)
+        with col_a:
+            st.markdown("**Período A**")
+            a_desde = st.date_input("Desde", value=date(today.year, today.month, 1), key="a_desde")
+            a_hasta = st.date_input("Hasta", value=today, key="a_hasta")
+        with col_b:
+            st.markdown("**Período B**")
+            prev_month  = today.month - 1 if today.month > 1 else 12
+            prev_year   = today.year if today.month > 1 else today.year - 1
+            prev_days_n = calendar.monthrange(prev_year, prev_month)[1]
+            b_desde = st.date_input("Desde", value=date(prev_year, prev_month, 1), key="b_desde")
+            b_hasta = st.date_input("Hasta", value=date(prev_year, prev_month, prev_days_n), key="b_hasta")
+
+        comparar_btn = st.button("📊 Comparar períodos")
+
+        if comparar_btn:
+            def load_from_dropbox_or_api(date_from, date_to, storage, sales):
+                dfs = []
+                current = date(date_from.year, date_from.month, 1)
+                while current <= date_to:
+                    path = f"data/historical/{current.strftime('%Y-%m')}.parquet"
+                    df_cached = storage.load_dataframe(path)
+                    if df_cached is not None:
+                        dfs.append(df_cached)
+                    if current.month == 12:
+                        current = date(current.year + 1, 1, 1)
+                    else:
+                        current = date(current.year, current.month + 1, 1)
+
+                if dfs:
+                    df_all = pd.concat(dfs, ignore_index=True)
+                    df_all["date_created"] = pd.to_datetime(df_all["date_created"])
+                    df_all["date"] = df_all["date_created"].dt.date
+                    df_filtered = df_all[(df_all["date"] >= date_from) & (df_all["date"] <= date_to)]
+                    if not df_filtered.empty:
+                        df_paid = df_filtered[df_filtered["status"] == "paid"].copy()
+                        if "net_amount" not in df_paid.columns:
+                            df_paid["net_amount"] = df_paid["total_amount"] - df_paid.get("sale_fee", 0)
+                        return {
+                            "revenue":    round(float(df_paid["total_amount"].sum()), 2),
+                            "net":        round(float(df_paid["net_amount"].sum()), 2),
+                            "orders":     df_paid["order_id"].nunique(),
+                            "units":      int(df_paid["quantity"].sum()),
+                            "avg_ticket": round(float(df_paid["total_amount"].mean()), 2) if not df_paid.empty else 0,
+                            "df":         df_paid,
+                        }
+                return sales.get_period_summary(date_from, date_to)
+
+            with st.spinner("Cargando datos de ambos períodos..."):
+                try:
+                    periodo_a = load_from_dropbox_or_api(a_desde, a_hasta, clients["storage"], clients["sales"])
+                    periodo_b = load_from_dropbox_or_api(b_desde, b_hasta, clients["storage"], clients["sales"])
+                except Exception as e:
+                    st.error(f"Error: {e}")
+                    st.stop()
+
+            label_a = f"{a_desde} → {a_hasta}"
+            label_b = f"{b_desde} → {b_hasta}"
+
+            st.markdown(f"#### {label_a} vs {label_b}")
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Ingresos brutos", fmt_currency(periodo_a["revenue"]), delta=delta_pct(periodo_a["revenue"], periodo_b["revenue"]))
+            c2.metric("Ingresos netos", fmt_currency(periodo_a["net"]), delta=delta_pct(periodo_a["net"], periodo_b["net"]))
+            c3.metric("Órdenes", f"{periodo_a['orders']:,}", delta=delta_pct(periodo_a["orders"], periodo_b["orders"]))
+            c4.metric("Unidades", f"{periodo_a['units']:,}", delta=delta_pct(periodo_a["units"], periodo_b["units"]))
+
+            if not periodo_a["df"].empty and not periodo_b["df"].empty:
+                df_a = periodo_a["df"].copy()
+                df_b = periodo_b["df"].copy()
+                df_a["dia"] = (pd.to_datetime(df_a["date_created"]) - pd.Timestamp(a_desde)).dt.days + 1
+                df_b["dia"] = (pd.to_datetime(df_b["date_created"]) - pd.Timestamp(b_desde)).dt.days + 1
+                daily_a = df_a.groupby("dia")["total_amount"].sum().reset_index()
+                daily_b = df_b.groupby("dia")["total_amount"].sum().reset_index()
+                daily_a["periodo"] = label_a
+                daily_b["periodo"] = label_b
+                df_chart = pd.concat([daily_a, daily_b])
+                fig = px.line(df_chart, x="dia", y="total_amount", color="periodo",
+                              title="Facturación por día del período",
+                              labels={"dia": "Día del período", "total_amount": "Ingresos", "periodo": "Período"},
+                              color_discrete_sequence=["#FFE600", "#3483FA"])
+                st.plotly_chart(fig, use_container_width=True)
+
+            st.markdown("---")
+            col_det_a, col_det_b = st.columns(2)
+            with col_det_a:
+                show_period_detail(periodo_a, label_a)
+            with col_det_b:
+                show_period_detail(periodo_b, label_b)
 
 
-def subir_factura_ml(token, pack_id, pdf_bytes, nombre_archivo):
-    url = f"https://api.mercadolibre.com/packs/{pack_id}/fiscal_documents"
-    r = requests.post(
-        url,
-        headers={"Authorization": f"Bearer {token}"},
-        files={"fiscal_document": (nombre_archivo, BytesIO(pdf_bytes), "application/pdf")}
-    )
-    return r.status_code, r.text
+# ══════════════════════════════════════════════════════════════════
+# PÁGINA: HISTORIAL
+# ══════════════════════════════════════════════════════════════════
+
+elif page == "🗄️ Historial":
+    st.title("🗄️ Carga de Historial")
+    clients = get_clients()
+
+    st.info("Cargá datos históricos mes a mes en Dropbox. Solo necesitás hacerlo una vez por período.")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        fecha_desde = st.date_input("Desde", value=date(2024, 1, 1))
+    with col2:
+        fecha_hasta = st.date_input("Hasta", value=date.today())
+
+    cargar_btn = st.button("📥 Cargar historial en Dropbox")
+
+    if cargar_btn:
+        if fecha_desde >= fecha_hasta:
+            st.error("La fecha de inicio debe ser anterior a la fecha final.")
+            st.stop()
+
+        meses = []
+        current = date(fecha_desde.year, fecha_desde.month, 1)
+        while current <= fecha_hasta:
+            days_in_month = calendar.monthrange(current.year, current.month)[1]
+            mes_fin = date(current.year, current.month, min(days_in_month,
+                          fecha_hasta.day if current.year == fecha_hasta.year and current.month == fecha_hasta.month
+                          else days_in_month))
+            meses.append((current, mes_fin))
+            if current.month == 12:
+                current = date(current.year + 1, 1, 1)
+            else:
+                current = date(current.year, current.month + 1, 1)
+
+        st.info(f"Se cargarán **{len(meses)} meses** desde {fecha_desde} hasta {fecha_hasta}")
+
+        progress_bar = st.progress(0)
+        status_text  = st.empty()
+        results      = []
+
+        for i, (mes_inicio, mes_fin) in enumerate(meses):
+            label = mes_inicio.strftime("%B %Y")
+            status_text.text(f"Cargando {label}...")
+            try:
+                df = clients["sales"].get_orders_by_daterange(mes_inicio, mes_fin)
+                if not df.empty:
+                    path = f"data/historical/{mes_inicio.strftime('%Y-%m')}.parquet"
+                    clients["storage"].save_dataframe(df, path)
+                    results.append({"Mes": label, "Órdenes": len(df), "Estado": "OK"})
+                else:
+                    results.append({"Mes": label, "Órdenes": 0, "Estado": "Sin datos"})
+            except Exception as e:
+                results.append({"Mes": label, "Órdenes": 0, "Estado": f"Error: {str(e)[:50]}"})
+            progress_bar.progress((i + 1) / len(meses))
+
+        status_text.text("Carga completada")
+        st.success(f"Historial cargado. {len([r for r in results if r['Estado'] == 'OK'])} meses exitosos.")
+        st.dataframe(pd.DataFrame(results), use_container_width=True, hide_index=True)
 
 
-def extraer_cfe_de_nombre(nombre_archivo):
-    match = re.search(r'[A-Z]-(\d+)\.pdf$', nombre_archivo)
-    return match.group(1) if match else None
+# ══════════════════════════════════════════════════════════════════
+# PÁGINA: COMPETENCIA
+# ══════════════════════════════════════════════════════════════════
 
+elif page == "🔍 Competencia":
+    st.title("🔍 Análisis de Competencia")
+    clients = get_clients()
 
-def normalizar_nombre(nombre):
-    nombre = str(nombre).strip().upper()
-    nombre = unicodedata.normalize('NFD', nombre)
-    nombre = ''.join(c for c in nombre if unicodedata.category(c) != 'Mn')
-    return nombre
+    tab_tracker, tab_search = st.tabs(["🎯 La Tentación", "🔍 Buscar otro competidor"])
 
+    with tab_tracker:
+        col_scan, _ = st.columns([1, 3])
+        with col_scan:
+            scan_btn = st.button("🔄 Escanear ahora")
 
-def similitud_nombres(a, b):
-    a = normalizar_nombre(a)
-    b = normalizar_nombre(b)
-    palabras_a = set(a.split())
-    palabras_b = set(b.split())
-    if not palabras_a or not palabras_b:
-        return 0
-    coincidencias = palabras_a & palabras_b
-    return len(coincidencias) / max(len(palabras_a), len(palabras_b))
+        tracker = CompetitorTracker(seller_id=175850089, seller_nickname="LATENTACIONSRL")
 
-
-def leer_excel(file_obj):
-    data = file_obj.read()
-    try:
-        return pd.read_excel(BytesIO(data), engine="xlrd")
-    except Exception:
-        return pd.read_excel(BytesIO(data), engine="openpyxl")
-
-
-def procesar_pdfs():
-    dbx_token = get_dropbox_token()
-    ml_token  = get_ml_token()
-    pdfs      = listar_pdfs_nuevos(dbx_token)
-
-    resultados = []
-    for archivo in pdfs:
-        nombre = archivo["name"]
-        path   = archivo["path_display"]
-
-        pdf_bytes = descargar_pdf(dbx_token, path)
-        order_id  = extraer_order_id(pdf_bytes)
-
-        if not order_id:
-            resultados.append({"archivo": nombre, "estado": "sin_order_id"})
-            continue
-
-        pack_id = obtener_pack_id(ml_token, order_id)
-        status, respuesta = subir_factura_ml(ml_token, pack_id, pdf_bytes, nombre)
-
-        if status in (200, 201):
-            mover_a_procesados(dbx_token, path, nombre)
-            resultados.append({"archivo": nombre, "order_id": order_id, "pack_id": pack_id, "estado": "ok"})
+        if scan_btn:
+            with st.spinner("Escaneando publicaciones de La Tentación..."):
+                df_tracker = tracker.save_snapshot()
         else:
-            resultados.append({"archivo": nombre, "order_id": order_id, "pack_id": pack_id, "estado": f"error_{status}", "detalle": respuesta})
+            with st.spinner("Cargando último snapshot..."):
+                df_tracker = tracker.load_snapshot()
+                if df_tracker is None:
+                    st.info("No hay datos aún. Hacé clic en 'Escanear ahora'.")
+                    df_tracker = pd.DataFrame()
 
-    return resultados
+        if not df_tracker.empty:
+            summary = tracker.get_summary()
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Publicaciones encontradas", summary["total_items"])
+            m2.metric("Precio promedio", f"${summary['avg_price']:,.0f}")
+            m3.metric("Precio mínimo", f"${summary['min_price']:,.0f}")
+            m4.metric("Precio máximo", f"${summary['max_price']:,.0f}")
+            st.caption(f"Último scan: {summary.get('last_snapshot', '—')}")
 
+            cats = summary.get("categories_found", {})
+            if cats:
+                st.markdown("**Items por categoría:**")
+                cols_cat = st.columns(len(cats))
+                for i, (cat, count) in enumerate(cats.items()):
+                    cols_cat[i].metric(cat.title(), count)
 
-@app.route("/webhook/dropbox", methods=["GET"])
-def dropbox_challenge():
-    challenge = request.args.get("challenge", "")
-    return challenge, 200, {"Content-Type": "text/plain"}
+            t1, t2, t3 = st.tabs(["📋 Todas las publicaciones", "🆕 Nuevas publicaciones", "💰 Cambios de precio"])
+            with t1:
+                cols_show = ["title", "price", "available_qty", "sold_qty", "category", "listing_type", "permalink"]
+                st.dataframe(df_tracker[[c for c in cols_show if c in df_tracker.columns]], use_container_width=True)
+            with t2:
+                df_new = tracker.detect_new_items()
+                if df_new.empty:
+                    st.info("No hay publicaciones nuevas desde el último scan.")
+                else:
+                    st.success(f"🆕 {len(df_new)} publicaciones nuevas detectadas")
+                    st.dataframe(df_new[["title", "price", "category", "permalink"]], use_container_width=True)
+            with t3:
+                df_price = tracker.detect_price_changes()
+                if df_price.empty:
+                    st.info("No hay cambios de precio desde el último scan.")
+                else:
+                    st.warning(f"💰 {len(df_price)} cambios de precio detectados")
+                    st.dataframe(df_price[["title", "prev_price", "price", "price_diff", "price_diff_pct", "direction"]], use_container_width=True)
 
+    with tab_search:
+        st.subheader("Buscar competidor")
+        col_input, col_btn = st.columns([3, 1])
+        with col_input:
+            seller_input = st.text_input("Nickname o User ID del competidor", placeholder="Ej: nombre_vendedor o 123456789")
+        with col_btn:
+            st.write("")
+            search_btn = st.button("🔍 Analizar")
 
-@app.route("/webhook/dropbox", methods=["POST"])
-def dropbox_webhook():
-    signature = request.headers.get("X-Dropbox-Signature", "")
-    expected  = hmac.new(DROPBOX_APP_SECRET.encode(), request.data, hashlib.sha256).hexdigest()
-    if not hmac.compare_digest(signature, expected):
-        return "Firma inválida", 403
-    time.sleep(3)
-    resultados = procesar_pdfs()
-    return jsonify({"procesados": resultados}), 200
+        if search_btn and seller_input:
+            with st.spinner(f"Analizando {seller_input}..."):
+                if not seller_input.isdigit():
+                    user = clients["competition"].search_seller_by_nickname(seller_input)
+                    if not user:
+                        st.error(f"No se encontró el vendedor '{seller_input}'")
+                        st.stop()
+                    seller_id = str(user["id"])
+                    st.success(f"Vendedor encontrado: **{user.get('nickname')}** (ID: {seller_id})")
+                else:
+                    seller_id = seller_input
 
+                profile = clients["competition"].get_seller_profile(seller_id)
+                col1, col2, col3 = st.columns(3)
+                col1.metric("Nivel", profile.get("level_id", "—"))
+                col2.metric("Transacciones", f"{profile.get('transactions_total', 0):,}")
+                col3.metric("Power Seller", profile.get("power_seller_status", "—"))
 
-@app.route("/procesar", methods=["GET"])
-def procesar_manual():
-    resultados = procesar_pdfs()
-    return jsonify({"procesados": resultados}), 200
-
-
-@app.route("/", methods=["GET"])
-def health():
-    return jsonify({"estado": "ok", "servicio": "facturas-ml"}), 200
-
-
-@app.route("/app", methods=["GET"])
-def interfaz():
-    html = """<!DOCTYPE html>
-<html lang="es">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Trackings DAC - eldomelbazar</title>
-<style>
-* { box-sizing: border-box; margin: 0; padding: 0; }
-body { background: #0a0a0a; font-family: Arial, sans-serif; min-height: 100vh; }
-.header { border-bottom: 1px solid #1e1e1e; padding: 20px 40px; display: flex; align-items: center; justify-content: space-between; }
-.logo-text { font-size: 20px; font-weight: 700; color: #ffffff; letter-spacing: -0.5px; }
-.logo-text span { color: #00bcd4; }
-.tag { font-size: 11px; color: #555; background: #1a1a1a; padding: 4px 10px; border-radius: 20px; }
-.content { max-width: 480px; margin: 0 auto; padding: 48px 24px; }
-.title { font-size: 18px; font-weight: 700; color: #f0f0f0; margin-bottom: 4px; }
-.subtitle { font-size: 13px; color: #666; margin-bottom: 36px; }
-.upload-zone { border: 1.5px solid #2a2a3a; border-radius: 10px; padding: 18px 20px; margin-bottom: 12px; cursor: pointer; display: flex; align-items: center; gap: 14px; transition: border-color 0.15s; background: #12121f; }
-.upload-zone:hover { border-color: #00bcd4; background: #13161f; }
-.upload-zone.done { border-color: #1d9e75; background: #0d1f18; }
-.zone-icon { width: 36px; height: 36px; border-radius: 8px; background: #1e1e30; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
-.zone-icon.done { background: #0f2a1e; }
-.zone-label { font-size: 11px; color: #555; margin-bottom: 3px; }
-.zone-name { font-size: 13px; font-weight: 500; color: #aaa; }
-.zone-check { margin-left: auto; color: #1d9e75; font-size: 18px; }
-input[type=file] { display: none; }
-.btn { width: 100%; padding: 14px; background: #00bcd4; color: #000000; border: none; border-radius: 10px; font-size: 15px; font-weight: 700; cursor: pointer; margin-top: 4px; transition: background 0.2s, color 0.2s; }
-.btn:disabled { background: #1e1e2e; color: #444; cursor: not-allowed; border: 1.5px solid #2a2a3a; }
-.btn:hover:not(:disabled) { background: #00d4ef; }
-.divider { border: none; border-top: 1px solid #1a1a1a; margin: 32px 0; }
-.summary { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-bottom: 20px; }
-.metric { text-align: center; padding: 16px 8px; background: #12121f; border-radius: 10px; border: 1.5px solid #2a2a3a; }
-.metric-val { font-size: 26px; font-weight: 700; color: #00bcd4; }
-.metric-lbl { font-size: 11px; color: #555; margin-top: 2px; }
-.result-row { display: flex; justify-content: space-between; align-items: center; padding: 12px 0; border-bottom: 1px solid #1a1a1a; }
-.r-name { font-size: 13px; font-weight: 600; color: #e0e0e0; }
-.r-link { font-size: 11px; color: #444; margin-top: 2px; }
-.badge { font-size: 11px; padding: 3px 10px; border-radius: 20px; font-weight: 600; }
-.badge-ok { background: #0d2a1e; color: #4ade80; border: 1px solid #1d9e75; }
-.badge-err { background: #2a0d0d; color: #f87171; border: 1px solid #a32d2d; }
-.badge-warn { background: #2a1e0d; color: #fbbf24; border: 1px solid #854f0b; }
-.procesando { color: #555; font-size: 13px; text-align: center; padding: 20px 0; }
-</style>
-</head>
-<body>
-<div class="header">
-  <div style="display:flex;align-items:center;gap:8px;">
-    <svg width="22" height="22" viewBox="0 0 22 22">
-      <circle cx="11" cy="11" r="9" fill="none" stroke="#00bcd4" stroke-width="2.2"/>
-      <line x1="11" y1="4" x2="11" y2="11" stroke="#00bcd4" stroke-width="2.2" stroke-linecap="round"/>
-    </svg>
-    <span class="logo-text"><span>eldomel</span>bazar.com.uy</span>
-  </div>
-  <span class="tag">Trackings DAC</span>
-</div>
-
-<div class="content">
-  <div class="title">Envio de trackings</div>
-  <div class="subtitle">Subí los archivos del dia y hace clic en procesar.</div>
-
-  <div class="upload-zone" id="zone-dac" onclick="document.getElementById('input-dac').click()">
-    <div class="zone-icon" id="icon-dac">
-      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#00bcd4" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
-    </div>
-    <div>
-      <div class="zone-label">Archivo DAC</div>
-      <div class="zone-name" id="nombre-dac">Seleccionar archivo .xlsx</div>
-    </div>
-    <div class="zone-check" id="check-dac" style="display:none;">&#10003;</div>
-    <input type="file" id="input-dac" accept=".xlsx,.xls">
-  </div>
-
-  <div class="upload-zone" id="zone-remito" onclick="document.getElementById('input-remito').click()">
-    <div class="zone-icon" id="icon-remito">
-      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#00bcd4" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
-    </div>
-    <div>
-      <div class="zone-label">Remito de tu sistema</div>
-      <div class="zone-name" id="nombre-remito">Seleccionar archivo .xls / .xlsx</div>
-    </div>
-    <div class="zone-check" id="check-remito" style="display:none;">&#10003;</div>
-    <input type="file" id="input-remito" accept=".xlsx,.xls">
-  </div>
-
-  <button class="btn" id="btn" disabled onclick="procesar()">Procesar trackings</button>
-
-  <div id="results"></div>
-</div>
-
-<script>
-  const inputDac = document.getElementById('input-dac');
-  const inputRemito = document.getElementById('input-remito');
-  const btn = document.getElementById('btn');
-
-  function check() {
-    btn.disabled = !(inputDac.files.length && inputRemito.files.length);
-  }
-
-  inputDac.addEventListener('change', () => {
-    if (inputDac.files.length) {
-      document.getElementById('nombre-dac').textContent = inputDac.files[0].name;
-      document.getElementById('zone-dac').classList.add('done');
-      document.getElementById('icon-dac').classList.add('done');
-      document.getElementById('icon-dac').innerHTML = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#1d9e75" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>';
-      document.getElementById('check-dac').style.display = 'block';
-    }
-    check();
-  });
-
-  inputRemito.addEventListener('change', () => {
-    if (inputRemito.files.length) {
-      document.getElementById('nombre-remito').textContent = inputRemito.files[0].name;
-      document.getElementById('zone-remito').classList.add('done');
-      document.getElementById('icon-remito').classList.add('done');
-      document.getElementById('icon-remito').innerHTML = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#1d9e75" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>';
-      document.getElementById('check-remito').style.display = 'block';
-    }
-    check();
-  });
-
-  async function procesar() {
-    btn.disabled = true;
-    btn.style.background = '#1a2e6e';
-    btn.style.color = '#ffffff';
-    btn.textContent = 'Procesando...';
-    const res = document.getElementById('results');
-    res.innerHTML = '<div class="procesando">Procesando... puede tardar hasta 60 segundos la primera vez.</div>';
-
-    const form = new FormData();
-    form.append('dac', inputDac.files[0]);
-    form.append('remito', inputRemito.files[0]);
-
-    try {
-      const r = await fetch('/enviar-tracking', { method: 'POST', body: form });
-      const data = await r.json();
-
-      if (data.error) {
-        res.innerHTML = '<div class="result-row"><div><div class="r-name">Error</div><div class="r-link">' + data.error + '</div></div><span class="badge badge-err">Error</span></div>';
-        return;
-      }
-
-      const items = data.resultados || [];
-      const ok = items.filter(i => i.mensaje === 'ok').length;
-      const errores = items.filter(i => i.mensaje !== 'ok' || i.estado).length;
-
-      let html = '<hr class="divider"><div class="summary">';
-      html += '<div class="metric"><div class="metric-val">' + ok + '</div><div class="metric-lbl">Enviados</div></div>';
-      html += '<div class="metric"><div class="metric-val">' + errores + '</div><div class="metric-lbl">Con problema</div></div>';
-      html += '<div class="metric"><div class="metric-val">' + items.length + '</div><div class="metric-lbl">Total</div></div>';
-      html += '</div>';
-
-      items.forEach(item => {
-        let badge, link = '';
-        if (item.estado && item.estado !== 'ok') {
-          const e = { cfe_no_encontrado: 'CFE no encontrado', pdf_no_encontrado_en_dropbox: 'PDF no encontrado en Dropbox', order_id_no_encontrado_en_pdf: 'Orden ML no encontrada' };
-          badge = '<span class="badge badge-warn">' + (e[item.estado] || item.estado) + '</span>';
-        } else {
-          badge = item.mensaje === 'ok' ? '<span class="badge badge-ok">Enviado</span>' : '<span class="badge badge-err">Error</span>';
-          if (item.link_dac) link = '<div class="r-link">' + item.link_dac + '</div>';
-        }
-        html += '<div class="result-row"><div><div class="r-name">' + item.cliente + '</div>' + link + '</div>' + badge + '</div>';
-      });
-
-      res.innerHTML = html;
-    } catch(e) {
-      res.innerHTML = '<div class="result-row"><div><div class="r-name">Error de conexion</div><div class="r-link">' + e.message + '</div></div><span class="badge badge-err">Error</span></div>';
-    } finally {
-      btn.disabled = false;
-      btn.style.background = '#00bcd4';
-      btn.style.color = '#000000';
-      btn.textContent = 'Procesar trackings';
-    }
-  }
-</script>
-</body>
-</html>"""
-    return html
+                st.subheader("Publicaciones activas")
+                df_items = clients["competition"].sync_seller(seller_id)
+                if not df_items.empty:
+                    col_a, col_b, col_c = st.columns(3)
+                    col_a.metric("Total publicaciones", len(df_items))
+                    col_b.metric("Precio promedio", fmt_currency(df_items["price"].mean()))
+                    col_c.metric("Unidades vendidas totales", f"{df_items['sold_qty'].sum():,}")
+                    fig = px.histogram(df_items, x="price", nbins=20, title="Distribución de precios", color_discrete_sequence=["#3483FA"])
+                    st.plotly_chart(fig, use_container_width=True)
+                    cols_show = ["title", "price", "sold_qty", "available_qty", "listing_type", "permalink"]
+                    st.dataframe(df_items[[c for c in cols_show if c in df_items.columns]], use_container_width=True)
 
 
-@app.route("/enviar-tracking", methods=["POST"])
-def enviar_tracking():
-    if "remito" not in request.files or "dac" not in request.files:
-        return jsonify({"error": "Se requieren los archivos 'remito' y 'dac'"}), 400
+# ══════════════════════════════════════════════════════════════════
+# PÁGINA: TENDENCIAS
+# ══════════════════════════════════════════════════════════════════
 
-    remito_file = request.files["remito"]
-    dac_file    = request.files["dac"]
+elif page == "📈 Tendencias":
+    st.title("📈 Tendencias de Mercado")
+    clients = get_clients()
 
-    remito_df = leer_excel(remito_file)
-    remito_df.columns = remito_df.columns.str.strip()
-    dac_df = leer_excel(dac_file)
-    dac_df = dac_df[dac_df["Oficina Origen"] != "JUAN LACAZE"].drop_duplicates("Guia")
-    dac_df["nombre_norm"] = dac_df["Destinatario"].apply(normalizar_nombre)
-    remito_df["nombre_norm"] = remito_df["Cliente"].apply(normalizar_nombre)
+    @st.cache_data(ttl=3600)
+    def load_categories():
+        return clients["categories"].get_categories_tree()
 
-    merged = remito_df.merge(dac_df[["nombre_norm", "Guia"]], on="nombre_norm", how="inner")
+    df_cats = load_categories()
+    if df_cats.empty:
+        st.error("No se pudieron cargar las categorías.")
+        st.stop()
 
-    remito_no_cruzado = remito_df[~remito_df["nombre_norm"].isin(merged["nombre_norm"])]
-    filas_fuzzy = []
-    for _, fila_r in remito_no_cruzado.iterrows():
-        mejor_match = None
-        mejor_score = 0
-        for _, fila_d in dac_df.iterrows():
-            score = similitud_nombres(fila_r["nombre_norm"], fila_d["nombre_norm"])
-            if score > mejor_score:
-                mejor_score = score
-                mejor_match = fila_d
-        if mejor_score >= 0.35 and mejor_match is not None:
-            fila_combinada = fila_r.copy()
-            fila_combinada["Guia"] = mejor_match["Guia"]
-            fila_combinada["match_score"] = round(mejor_score, 2)
-            filas_fuzzy.append(fila_combinada)
+    cat_options = {row["name"]: row["category_id"] for _, row in df_cats.iterrows()}
+    selected_cat_name = st.selectbox("Seleccioná una categoría", list(cat_options.keys()))
+    selected_cat_id   = cat_options[selected_cat_name]
 
-    if filas_fuzzy:
-        merged_fuzzy = pd.DataFrame(filas_fuzzy)
-        merged = pd.concat([merged, merged_fuzzy], ignore_index=True)
+    col_btn, _ = st.columns([1, 4])
+    with col_btn:
+        analyze_btn = st.button("📊 Analizar categoría")
 
-    if merged.empty:
-        return jsonify({"error": "No se encontraron cruces entre remito y DAC"}), 200
-
-    dbx_token = get_dropbox_token()
-    ml_token  = get_ml_token()
-
-    seller_resp = requests.get(
-        "https://api.mercadolibre.com/users/me",
-        headers={"Authorization": f"Bearer {ml_token}"}
-    )
-    seller_id = seller_resp.json()["id"]
-
-    todos_pdfs = listar_pdfs_nuevos(dbx_token)
-    r_proc = requests.post(
-        "https://api.dropboxapi.com/2/files/list_folder",
-        headers={"Authorization": f"Bearer {dbx_token}", "Content-Type": "application/json"},
-        json={"path": CARPETA_PROCESADOS, "recursive": False}
-    )
-    procesados = [a for a in r_proc.json().get("entries", []) if a[".tag"] == "file" and a["name"].endswith(".pdf")]
-    todos_pdfs = todos_pdfs + procesados
-
-    mapa_cfe_pdf = {}
-    for archivo in todos_pdfs:
-        cfe = extraer_cfe_de_nombre(archivo["name"])
-        if cfe:
-            mapa_cfe_pdf[cfe] = archivo["path_display"]
-
-    resultados = []
-    for _, fila in merged.iterrows():
-        cliente  = fila["Cliente"]
-        guia     = str(int(fila["Guia"]))
-        link_dac = f"https://www.dac.com.uy/envios/rastreo/Codigo_Rastreo/{guia}"
-
-        cfe_raw   = str(fila.get("Fac N°Int/Cfe", ""))
-        cfe_match = re.search(r'-(\d+)\s*$', cfe_raw.strip())
-        if not cfe_match:
-            resultados.append({"cliente": cliente, "estado": "cfe_no_encontrado", "cfe_raw": cfe_raw})
-            continue
-        cfe = cfe_match.group(1)
-
-        pdf_path = mapa_cfe_pdf.get(cfe)
-        if not pdf_path:
-            resultados.append({"cliente": cliente, "cfe": cfe, "estado": "pdf_no_encontrado_en_dropbox"})
-            continue
-
-        pdf_bytes = descargar_pdf(dbx_token, pdf_path)
-        order_id  = extraer_order_id(pdf_bytes)
-        if not order_id:
-            resultados.append({"cliente": cliente, "cfe": cfe, "estado": "order_id_no_encontrado_en_pdf"})
-            continue
-
-        pack_id = obtener_pack_id(ml_token, order_id)
-
-        mensaje = (
-            f"¡Hola {cliente}! Tu pedido ya está en camino 🚚\n"
-            f"Podés seguir tu envío en tiempo real acá:\n{link_dac}"
-        )
-
-        order_data = requests.get(
-            f"https://api.mercadolibre.com/orders/{order_id}",
-            headers={"Authorization": f"Bearer {ml_token}"}
-        ).json()
-        buyer_id = str(order_data.get("buyer", {}).get("id", ""))
-
-        r_msg = requests.post(
-            f"https://api.mercadolibre.com/messages/packs/{pack_id}/sellers/{seller_id}?tag=post_sale",
-            headers={"Authorization": f"Bearer {ml_token}", "Content-Type": "application/json"},
-            json={
-                "from": {"user_id": str(seller_id)},
-                "to": {"user_id": buyer_id},
-                "text": mensaje
-            }
-        )
-
-        r_nota = requests.post(
-            f"https://api.mercadolibre.com/orders/{order_id}/notes",
-            headers={"Authorization": f"Bearer {ml_token}", "Content-Type": "application/json"},
-            json={"note": link_dac}
-        )
-
-        shipment_id = order_data.get("shipping", {}).get("id")
-        r_ship = None
-        if shipment_id:
-            service_id = order_data.get("shipping_option", {}).get("shipping_method_id")
-            if not service_id:
-                shipment_data = requests.get(
-                    f"https://api.mercadolibre.com/shipments/{shipment_id}",
-                    headers={"Authorization": f"Bearer {ml_token}"}
-                ).json()
-                service_id = shipment_data.get("shipping_option", {}).get("shipping_method_id")
-
-            ship_body = {
-                "status": "shipped",
-                "tracking_number": link_dac,
-                "tracking_method": "Otros"
-            }
-            if service_id:
-                ship_body["service_id"] = service_id
-
-            r_ship = requests.put(
-                f"https://api.mercadolibre.com/shipments/{shipment_id}",
-                headers={"Authorization": f"Bearer {ml_token}", "Content-Type": "application/json"},
-                json=ship_body
-            )
-            print(f"  Shipment {shipment_id} → {r_ship.status_code} {r_ship.text[:200]}")
-
-        resultados.append({
-            "cliente":      cliente,
-            "cfe":          cfe,
-            "guia_dac":     guia,
-            "order_id":     order_id,
-            "pack_id":      pack_id,
-            "link_dac":     link_dac,
-            "mensaje":      "ok" if r_msg.status_code in (200, 201) else f"error_{r_msg.status_code}",
-            "nota":         "ok" if r_nota.status_code in (200, 201) else f"error_{r_nota.status_code}",
-            "envio_estado": "ok" if r_ship and r_ship.status_code in (200, 201) else f"error_{r_ship.status_code if r_ship else 'sin_shipment'}",
-        })
-
-    return jsonify({"resultados": resultados}), 200
+    if analyze_btn:
+        with st.spinner(f"Analizando {selected_cat_name}..."):
+            tab1, tab2, tab3 = st.tabs(["🏆 Top Items", "🔍 Tendencias", "💡 Oportunidades"])
+            with tab1:
+                df_top = clients["categories"].get_top_items_in_category(selected_cat_id)
+                if not df_top.empty:
+                    st.dataframe(df_top[["title", "price", "sold_qty", "seller_nickname", "permalink"]], use_container_width=True)
+                else:
+                    st.info("Sin datos.")
+            with tab2:
+                df_trends = clients["categories"].get_search_trends(selected_cat_id)
+                if not df_trends.empty:
+                    for _, row in df_trends.iterrows():
+                        st.write(f"**#{row['rank']}** {row['keyword']}")
+                else:
+                    st.info("Sin datos de tendencias para esta categoría.")
+            with tab3:
+                df_opp = clients["categories"].find_opportunities(selected_cat_id)
+                if not df_opp.empty:
+                    st.success(f"Se encontraron {len(df_opp)} oportunidades")
+                    st.dataframe(df_opp[["title", "sold_qty", "seller_count", "opportunity_score", "price"]], use_container_width=True)
+                else:
+                    st.info("Sin oportunidades claras en esta categoría.")
 
 
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=False)
+# ══════════════════════════════════════════════════════════════════
+# PÁGINA: KEYWORDS
+# ══════════════════════════════════════════════════════════════════
+
+elif page == "🔑 Keywords":
+    st.title("🔑 Investigación de Keywords")
+    clients = get_clients()
+
+    st.subheader("Expandir keywords")
+    seed = st.text_input("Keyword semilla", placeholder="Ej: zapatillas running")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        depth = st.selectbox("Profundidad de expansión", [1, 2], index=1)
+    with col2:
+        expand_btn = st.button("🔍 Expandir")
+
+    if expand_btn and seed:
+        with st.spinner(f"Expandiendo '{seed}'..."):
+            df_kw = clients["keywords"].expand_keywords(seed, depth=depth)
+        if not df_kw.empty:
+            fig = px.bar(df_kw.head(20), x="keyword", y="total_results",
+                         title="Resultados por keyword",
+                         color_discrete_sequence=["#3483FA"])
+            fig.update_layout(xaxis_tickangle=-45)
+            st.plotly_chart(fig, use_container_width=True)
+            st.dataframe(df_kw, use_container_width=True)
+
+    st.markdown("---")
+    st.subheader("Evaluar título")
+    title_input  = st.text_input("Título a evaluar", placeholder="Zapatillas Running Hombre Nike Air Max Talle 42")
+    cat_id_input = st.text_input("Category ID (opcional)", placeholder="MLU5726")
+
+    if st.button("⭐ Evaluar") and title_input and cat_id_input:
+        with st.spinner("Evaluando..."):
+            result = clients["keywords"].score_title(title_input, cat_id_input)
+        score = result.get("score", 0)
+        color = "🟢" if score >= 70 else "🟡" if score >= 40 else "🔴"
+        st.metric(f"Score del título {color}", f"{score}/100")
+        if result.get("matched_keywords"):
+            st.success("✅ Keywords encontradas: " + ", ".join(result["matched_keywords"]))
+        if result.get("suggested_keywords"):
+            st.warning("💡 Sugerencias para agregar: " + ", ".join(result["suggested_keywords"]))
+        if result.get("too_long"):
+            st.warning(f"⚠️ Título muy largo ({result['title_length']} chars). Recomendado: máx 60.")
