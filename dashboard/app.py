@@ -241,16 +241,16 @@ if page == "🏠 Resumen":
         with ac3:
             st.metric("Promedio diario (últ. 7d)", fmt_currency(forecast["daily_trend_revenue"]))
 
-        with st.expander("🔍 Detalle del cálculo (5 factores)"):
+        with st.expander("🔍 Detalle del cálculo (6 factores)"):
             d1, d2, d3 = st.columns(3)
             with d1:
-                st.metric("1️⃣ Promedio diario del mes", fmt_currency(forecast["proj_daily_avg"]), help="Peso: 25%")
+                st.metric("1️⃣ Promedio diario del mes", fmt_currency(forecast["proj_daily_avg"]), help="Peso: 15%")
             with d2:
-                st.metric("2️⃣ Tendencia últimos 7 días", fmt_currency(forecast["proj_trend_7d"]), help="Peso: 30%")
+                st.metric("2️⃣ Tendencia últimos 7 días", fmt_currency(forecast["proj_trend_7d"]), help="Peso: 25%")
             with d3:
                 ly = forecast.get("last_year_revenue")
                 st.metric("3️⃣ Mismo mes año anterior", fmt_currency(ly) if ly else "Sin datos", help="Peso: 20%")
-            d4, d5 = st.columns(2)
+            d4, d5, d6 = st.columns(3)
             with d4:
                 seasonal = forecast.get("proj_seasonal")
                 yrs = forecast.get("seasonal_years", 0)
@@ -261,8 +261,60 @@ if page == "🏠 Resumen":
                 arrow = "📈" if acc > 1 else "📉" if acc < 1 else "➡️"
                 st.metric("5️⃣ Velocidad de crecimiento", fmt_currency(forecast.get("proj_acceleration", 0)),
                           delta=f"{arrow} Factor: {acc:.2f}x", help="Peso: 10%")
+            with d6:
+                shape = forecast.get("calendar_shape_pct", 0.0)
+                arrow6 = "📈" if shape > 0 else "📉" if shape < 0 else "➡️"
+                st.metric("6️⃣ Forma intra-mes (días)", fmt_currency(forecast.get("proj_calendar", 0)),
+                          delta=f"{arrow6} {shape:+.1f}% vs plano", help="Peso: 15%")
             if forecast.get("vs_last_year_pct") is not None:
                 st.info(f"📊 Crecimiento vs mismo mes del año anterior: **{forecast['vs_last_year_pct']:+.1f}%**")
+
+    # ── Backtest del pronóstico (recalibración de pesos) ──────────
+    st.markdown("---")
+    st.subheader("🎯 Backtest del pronóstico (MAPE)")
+    st.caption("Re-corre la proyección como si fuera el día X de meses pasados y mide el error % real de cada factor. Sirve para recalibrar los pesos con datos en vez de a ojo.")
+
+    bt_col1, _bt_col2 = st.columns([1, 2])
+    with bt_col1:
+        bt_months = st.selectbox("Meses a testear", [3, 4, 6], index=2)
+    run_bt = st.button("▶️ Correr backtest (tarda ~30-60s)")
+
+    if run_bt:
+        with st.spinner("Bajando meses anteriores y replayando proyecciones..."):
+            try:
+                bt = clients["sales"].backtest_forecast(months_back=bt_months, cutoffs=(5, 10, 15, 20))
+            except Exception as e:
+                bt = {"error": str(e)}
+
+        if "error" in bt:
+            st.warning(f"No se pudo correr el backtest: {bt['error']}")
+        elif bt.get("samples", 0) == 0:
+            st.warning("No hay meses cerrados con datos suficientes en la ventana de la API.")
+        else:
+            st.caption(f"Basado en {bt['samples']} muestras · {bt['months_tested']} meses · cortes en días {bt['cutoffs']}")
+            f = bt["factor_mape"]
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("1️⃣ Promedio diario", f"{f['proj1']:.1f}%", help="Error medio del factor por sí solo")
+            c2.metric("2️⃣ Tendencia 7d", f"{f['proj2']:.1f}%")
+            c3.metric("5️⃣ Velocidad", f"{f['proj5']:.1f}%")
+            c4.metric("6️⃣ Forma intra-mes", f"{f['proj6']:.1f}%")
+
+            e1, e2 = st.columns(2)
+            e1.metric("Ensemble actual", f"{bt['ensemble_mape_current']:.1f}%")
+            mejora = bt["ensemble_mape_optimized"] - bt["ensemble_mape_current"]
+            e2.metric("Ensemble óptimo", f"{bt['ensemble_mape_optimized']:.1f}%",
+                      delta=f"{mejora:+.1f} pts", delta_color="inverse")
+
+            ow = bt["optimized_weights"]
+            st.success(
+                "**Pesos óptimos sugeridos** (sobre los 4 factores extrapolables):  "
+                f"P1 {ow['proj1']:.0%} · P2 {ow['proj2']:.0%} · P5 {ow['proj5']:.0%} · P6 {ow['proj6']:.0%}"
+            )
+            st.caption(
+                "Los factores 3 (año anterior) y 4 (estacionalidad) no se backtestean: no hay histórico en Dropbox, "
+                "hoy colapsan al factor 1. Para aplicarlos, en get_monthly_forecast poné w2/w5/w6 con estos valores y "
+                "repartí el peso de P1 entre w1 (y w3/w4 cuando cargues histórico)."
+            )
 
 
 # ══════════════════════════════════════════════════════════════════
