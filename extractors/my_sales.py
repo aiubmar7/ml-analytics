@@ -420,3 +420,170 @@ class MySalesExtractor:
             "daily_avg_revenue":   round(daily_avg_revenue, 2),
             "daily_trend_revenue": round(daily_trend_revenue, 2),
         }
+
+    def backtest_forecast(self, months_back: int = 6, cutoffs=(5, 10, 15, 20)) -> dict:
+        """
+        Backtest del pronóstico: re-corre la proyección como si fuera el
+        día X de meses ya cerrados y mide el error (MAPE) contra el total
+        real de cada mes.
+
+        Solo backtestea los factores reproducibles con la data de la API:
+          - proj1 (promedio diario), proj2 (tendencia 7d),
+            proj5 (velocidad), proj6 (forma intra-mes).
+        Los factores 3 (año anterior) y 4 (estacionalidad) dependen de
+        historial en Dropbox que no existe para meses pasados; en el
+        ensemble actual colapsan al factor 1 (igual que en producción),
+        por eso el peso efectivo de proj1 es w1+w3+w4 = 0.50.
+
+        Para no chocar con el tope de 10.000 órdenes de get_orders, baja
+        la data mes por mes (con su ventana de 90 días) vía
+        get_orders_by_daterange.
+
+        Devuelve: MAPE por factor, MAPE del ensemble con los pesos
+        actuales, y los pesos óptimos que minimizan el MAPE sobre estos
+        datos (búsqueda en grilla sobre el símplex).
+        """
+        import numpy as np
+
+        today = date.today()
+
+        # Meses completos a testear (excluye el mes actual)
+        months = []
+        y, m = today.year, today.month
+        for _ in range(months_back):
+            m -= 1
+            if m == 0:
+                m, y = 12, y - 1
+            months.append((y, m))
+
+        samples = []        # cada uno: [p1, p2, p5, p6, actual]
+        tested_months = set()
+
+        for (yy, mm) in months:
+            dim     = calendar.monthrange(yy, mm)[1]
+            m_start = date(yy, mm, 1)
+            m_end   = date(yy, mm, dim)
+            win_start = m_start - timedelta(days=90)
+
+            try:
+                df_span = self.get_orders_by_daterange(win_start, m_end)
+            except Exception:
+                continue
+            if df_span.empty:
+                continue
+
+            df_span = df_span[df_span["status"] == "paid"].copy()
+            if df_span.empty or "date" not in df_span.columns:
+                continue
+
+            df_m   = df_span[(df_span["date"] >= m_start) & (df_span["date"] <= m_end)]
+            actual = float(df_m["total_amount"].sum())
+            if actual <= 0:
+                continue
+
+            for K in cutoffs:
+                if K >= dim:
+                    continue
+                cutoff = date(yy, mm, K)
+                df_el  = df_m[df_m["date"] <= cutoff]
+                if df_el.empty:
+                    continue
+                rev_sf = float(df_el["total_amount"].sum())
+                if rev_sf <= 0:
+                    continue
+
+                days_rem  = dim - K
+                daily_avg = rev_sf / K
+
+                # Factor 1: promedio diario plano
+                p1 = rev_sf + daily_avg * days_rem
+
+                # Factor 2: tendencia 7 días previos al corte
+                last7 = df_el[df_el["date"] >= (cutoff - timedelta(days=6))]
+                d7    = max(len(last7["date"].unique()), 1)
+                trend = float(last7["total_amount"].sum()) / d7
+                p2    = rev_sf + trend * days_rem
+
+                # Factor 5: aceleración (últ. 3d vs días 4-10 dentro del mes)
+                l3 = df_el[df_el["date"] >= (cutoff - timedelta(days=2))]
+                pp = df_el[(df_el["date"] >= (cutoff - timedelta(days=9))) &
+                           (df_el["date"] <  (cutoff - timedelta(days=2)))]
+                d3 = max(len(l3["date"].unique()), 1)
+                dp = max(len(pp["date"].unique()), 1)
+                a3 = float(l3["total_amount"].sum()) / d3 if not l3.empty else daily_avg
+                ap = float(pp["total_amount"].sum()) / dp if not pp.empty else daily_avg
+                accel = max(0.5, min(2.0, a3 / ap if ap > 0 else 1.0))
+                p5 = rev_sf + daily_avg * accel * days_rem
+
+                # Factor 6: forma intra-mes (ventana 90d previa al corte)
+                df_win = df_span[(df_span["date"] >= (cutoff - timedelta(days=90))) &
+                                 (df_span["date"] <  cutoff)]
+                wd_mult = {wd: 1.0 for wd in range(7)}
+                if not df_win.empty:
+                    daily_w = df_win.groupby("date")["total_amount"].sum().reset_index()
+                    daily_w["wd"] = daily_w["date"].apply(lambda d: d.weekday())
+                    od = float(daily_w["total_amount"].mean())
+                    if od > 0:
+                        for wd in range(7):
+                            sub = daily_w[daily_w["wd"] == wd]
+                            if not sub.empty:
+                                wd_mult[wd] = float(sub["total_amount"].mean()) / od
+                wr = 0.0
+                for dn in range(K + 1, dim + 1):
+                    wr += wd_mult.get(date(yy, mm, dn).weekday(), 1.0)
+                p6 = rev_sf + daily_avg * wr
+
+                samples.append([p1, p2, p5, p6, actual])
+                tested_months.add((yy, mm))
+
+        if not samples:
+            return {"samples": 0, "months_tested": 0, "cutoffs": list(cutoffs),
+                    "error": "No hay meses cerrados con datos suficientes en la ventana de la API"}
+
+        arr    = np.array(samples, dtype=float)   # (n, 5)
+        P      = arr[:, :4]                        # p1, p2, p5, p6
+        y_true = arr[:, 4]
+
+        def mape(pred):
+            return float(np.mean(np.abs(pred - y_true) / y_true) * 100)
+
+        factor_mape = {
+            "proj1": mape(P[:, 0]),
+            "proj2": mape(P[:, 1]),
+            "proj5": mape(P[:, 2]),
+            "proj6": mape(P[:, 3]),
+        }
+
+        # Ensemble con pesos ACTUALES (3 y 4 colapsan a p1):
+        # efectivo -> p1=w1+w3+w4=0.50, p2=0.25, p5=0.10, p6=0.15
+        w_cur   = np.array([0.50, 0.25, 0.10, 0.15])
+        ens_cur = mape(P @ w_cur)
+
+        # Pesos óptimos: grilla sobre el símplex (paso 0.05) que minimiza MAPE
+        step = 0.05
+        n    = int(round(1 / step))
+        best_w, best_mape = w_cur, ens_cur
+        for a in range(n + 1):
+            for b in range(n + 1 - a):
+                for c in range(n + 1 - a - b):
+                    d = n - a - b - c
+                    w = np.array([a, b, c, d], dtype=float) * step
+                    mp = mape(P @ w)
+                    if mp < best_mape:
+                        best_mape, best_w = mp, w
+
+        return {
+            "samples":                 len(samples),
+            "months_tested":           len(tested_months),
+            "cutoffs":                 list(cutoffs),
+            "factor_mape":             {k: round(v, 1) for k, v in factor_mape.items()},
+            "ensemble_mape_current":   round(ens_cur, 1),
+            "ensemble_mape_optimized": round(best_mape, 1),
+            "current_weights_eff":     {"proj1": 0.50, "proj2": 0.25, "proj5": 0.10, "proj6": 0.15},
+            "optimized_weights":       {
+                "proj1": round(float(best_w[0]), 2),
+                "proj2": round(float(best_w[1]), 2),
+                "proj5": round(float(best_w[2]), 2),
+                "proj6": round(float(best_w[3]), 2),
+            },
+        }
