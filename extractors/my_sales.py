@@ -374,12 +374,54 @@ class MySalesExtractor:
 
         # ── Proyección ponderada (6 factores) ─────────────────────
         # Se le baja peso al promedio plano (factor 1) y se le da al
-        # factor 6 (forma intra-mes), que es la versión "inteligente" de
-        # ese mismo cálculo.
-        w1, w2, w3, w4, w5, w6 = 0.15, 0.25, 0.20, 0.15, 0.10, 0.15
+        # factor 6 (forma intra-mes). Al factor 5 (velocidad) se le bajó
+        # el peso porque el backtest mostró que es el menos preciso.
+        w1, w2, w3, w4, w5, w6 = 0.15, 0.25, 0.20, 0.15, 0.05, 0.20
         forecast_revenue = (proj1_revenue * w1) + (proj2_revenue * w2) + (proj3_revenue * w3) + (proj4_revenue * w4) + (proj5_revenue * w5) + (proj6_revenue * w6)
         forecast_units   = (proj1_units   * w1) + (proj2_units   * w2) + (proj3_units   * w3) + (proj4_units   * w4) + (proj5_units   * w5) + (proj6_units   * w6)
         forecast_orders  = (proj1_orders  * w1) + (proj2_orders  * w2) + (proj3_orders  * w3) + (proj4_orders  * w4) + (proj5_orders  * w5) + (proj6_orders  * w6)
+
+        ensemble_revenue = forecast_revenue  # guardar la versión pre-blend
+
+        # ── Blend por confianza (shrinkage hacia el nivel base) ───
+        # A principio de mes el ensemble extrapola pocos días y es
+        # inestable (el backtest lo confirma: ~24% de error a día 5).
+        # Lo mezclamos con el nivel base reciente (promedio ponderado de
+        # los últimos 3 meses completos, vía API), con peso α que crece
+        # con los días transcurridos: temprano confía en el base, tarde
+        # en la extrapolación. α = días_transcurridos / días_del_mes.
+        baseline_revenue = baseline_units = baseline_orders = None
+        try:
+            b_rev, b_un, b_or = [], [], []
+            by, bm = today.year, today.month
+            for _ in range(3):              # 3 meses previos (nuevo -> viejo)
+                bm -= 1
+                if bm == 0:
+                    bm, by = 12, by - 1
+                bdim = calendar.monthrange(by, bm)[1]
+                dfb = self.get_orders_by_daterange(date(by, bm, 1), date(by, bm, bdim))
+                if not dfb.empty:
+                    dfb = dfb[dfb["status"] == "paid"]
+                    tot = float(dfb["total_amount"].sum())
+                    if tot > 0:
+                        b_rev.append(tot)
+                        b_un.append(int(dfb["quantity"].sum()))
+                        b_or.append(dfb["order_id"].nunique())
+            if b_rev:
+                # pesos por recencia: el mes más reciente pesa más (3,2,1)
+                ws = list(range(len(b_rev), 0, -1))   # ej. [3,2,1]
+                sw = float(sum(ws))
+                baseline_revenue = sum(w * v for w, v in zip(ws, b_rev)) / sw
+                baseline_units   = sum(w * v for w, v in zip(ws, b_un))  / sw
+                baseline_orders  = sum(w * v for w, v in zip(ws, b_or))  / sw
+        except Exception:
+            pass
+
+        blend_alpha = days_elapsed / days_in_month
+        if baseline_revenue and baseline_revenue > 0:
+            forecast_revenue = blend_alpha * forecast_revenue + (1 - blend_alpha) * baseline_revenue
+            forecast_units   = blend_alpha * forecast_units   + (1 - blend_alpha) * baseline_units
+            forecast_orders  = blend_alpha * forecast_orders  + (1 - blend_alpha) * baseline_orders
 
         # ── Comparaciones ─────────────────────────────────────────
         vs_prev_pct = None
@@ -417,6 +459,9 @@ class MySalesExtractor:
             "weekday_weights":     {int(k): round(v, 2) for k, v in wd_mult.items()},
             "calendar_shape_pct":  round((weight_remaining / days_remaining - 1) * 100, 1) if days_remaining > 0 else 0.0,
             "seasonal_years":      len(seasonal_revenues),
+            "ensemble_revenue":    round(ensemble_revenue, 2),
+            "baseline_revenue":    round(baseline_revenue, 2) if baseline_revenue else None,
+            "blend_alpha":         round(blend_alpha, 2),
             "daily_avg_revenue":   round(daily_avg_revenue, 2),
             "daily_trend_revenue": round(daily_trend_revenue, 2),
         }
@@ -476,27 +521,58 @@ class MySalesExtractor:
         except Exception:
             pass
 
-        samples = []        # cada uno: [p1, p2, p5, p6, actual]
-        sample_cuts = []    # el día de corte K de cada muestra (paralelo a samples)
+        samples = []          # [p1, p2, p5, p6, actual]
+        sample_cuts = []      # día de corte K de cada muestra
+        sample_alpha = []     # α = K/dim de cada muestra
+        sample_base = []      # nivel base del mes (o NaN si no hay)
         tested_months = set()
 
-        for (yy, mm) in months:
-            dim     = calendar.monthrange(yy, mm)[1]
-            m_start = date(yy, mm, 1)
-            m_end   = date(yy, mm, dim)
+        # Bajar los meses a testear + los 3 previos al más viejo (para el
+        # nivel base del blend). Cada mes se baja UNA sola vez.
+        all_months = list(months)
+        ey, em = months[-1]              # mes más viejo a testear
+        for _ in range(3):
+            em -= 1
+            if em == 0:
+                em, ey = 12, ey - 1
+            all_months.append((ey, em))
 
-            # Solo el mes a testear (sin solapamiento entre meses)
+        month_df, month_total = {}, {}
+        for (yy, mm) in all_months:
+            dim = calendar.monthrange(yy, mm)[1]
             try:
-                df_m = self.get_orders_by_daterange(m_start, m_end)
+                dfm = self.get_orders_by_daterange(date(yy, mm, 1), date(yy, mm, dim))
             except Exception:
                 continue
-            if df_m.empty or "date" not in df_m.columns:
+            if dfm.empty or "date" not in dfm.columns:
                 continue
+            dfm = dfm[dfm["status"] == "paid"].copy()
+            month_df[(yy, mm)]    = dfm
+            month_total[(yy, mm)] = float(dfm["total_amount"].sum())
 
-            df_m   = df_m[df_m["status"] == "paid"].copy()
-            actual = float(df_m["total_amount"].sum())
-            if actual <= 0:
+        def _baseline_for(yy, mm):
+            """Promedio de los 3 meses previos, ponderado por recencia."""
+            vals = []
+            py, pm = yy, mm
+            for _ in range(3):
+                pm -= 1
+                if pm == 0:
+                    pm, py = 12, py - 1
+                t = month_total.get((py, pm))
+                if t and t > 0:
+                    vals.append(t)
+            if not vals:
+                return None
+            ws = list(range(len(vals), 0, -1))   # el más reciente pesa más
+            return sum(w * v for w, v in zip(ws, vals)) / float(sum(ws))
+
+        for (yy, mm) in months:
+            dim    = calendar.monthrange(yy, mm)[1]
+            df_m   = month_df.get((yy, mm))
+            actual = month_total.get((yy, mm), 0.0)
+            if df_m is None or df_m.empty or actual <= 0:
                 continue
+            base_m = _baseline_for(yy, mm)
 
             for K in cutoffs:
                 if K >= dim:
@@ -540,6 +616,8 @@ class MySalesExtractor:
 
                 samples.append([p1, p2, p5, p6, actual])
                 sample_cuts.append(K)
+                sample_alpha.append(K / dim)
+                sample_base.append(base_m if base_m else np.nan)
                 tested_months.add((yy, mm))
 
         if not samples:
@@ -561,8 +639,8 @@ class MySalesExtractor:
         }
 
         # Ensemble con pesos ACTUALES (3 y 4 colapsan a p1):
-        # efectivo -> p1=w1+w3+w4=0.50, p2=0.25, p5=0.10, p6=0.15
-        w_cur   = np.array([0.50, 0.25, 0.10, 0.15])
+        # efectivo -> p1=w1+w3+w4=0.50, p2=0.25, p5=0.05, p6=0.20
+        w_cur   = np.array([0.50, 0.25, 0.05, 0.20])
         ens_cur = mape(P @ w_cur)
 
         # Pesos óptimos: grilla sobre el símplex (paso 0.05) que minimiza MAPE
@@ -589,6 +667,22 @@ class MySalesExtractor:
                 err = np.abs(ens_pred[mask] - y_true[mask]) / y_true[mask]
                 mape_by_cutoff[int(K)] = round(float(np.mean(err) * 100), 1)
 
+        # Mismo cálculo pero CON el blend por confianza:
+        #   pred = α·ensemble + (1-α)·nivel_base   (α = K/dim)
+        base_arr  = np.array(sample_base, dtype=float)
+        alpha_arr = np.array(sample_alpha, dtype=float)
+        have_base = ~np.isnan(base_arr)
+        blend_pred = ens_pred.copy()
+        blend_pred[have_base] = (alpha_arr[have_base] * ens_pred[have_base] +
+                                 (1.0 - alpha_arr[have_base]) * base_arr[have_base])
+        ens_blend = float(np.mean(np.abs(blend_pred - y_true) / y_true) * 100)
+        mape_by_cutoff_blend = {}
+        for K in sorted(set(sample_cuts)):
+            mask = cuts_arr == K
+            if mask.any():
+                err = np.abs(blend_pred[mask] - y_true[mask]) / y_true[mask]
+                mape_by_cutoff_blend[int(K)] = round(float(np.mean(err) * 100), 1)
+
         return {
             "samples":                 len(samples),
             "months_tested":           len(tested_months),
@@ -596,8 +690,10 @@ class MySalesExtractor:
             "factor_mape":             {k: round(v, 1) for k, v in factor_mape.items()},
             "ensemble_mape_current":   round(ens_cur, 1),
             "ensemble_mape_optimized": round(best_mape, 1),
+            "ensemble_mape_blend":     round(ens_blend, 1),
             "mape_by_cutoff":          mape_by_cutoff,
-            "current_weights_eff":     {"proj1": 0.50, "proj2": 0.25, "proj5": 0.10, "proj6": 0.15},
+            "mape_by_cutoff_blend":    mape_by_cutoff_blend,
+            "current_weights_eff":     {"proj1": 0.50, "proj2": 0.25, "proj5": 0.05, "proj6": 0.20},
             "optimized_weights":       {
                 "proj1": round(float(best_w[0]), 2),
                 "proj2": round(float(best_w[1]), 2),
