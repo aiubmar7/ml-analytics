@@ -305,6 +305,14 @@ if page == "🏠 Resumen":
             e2.metric("Ensemble óptimo", f"{bt['ensemble_mape_optimized']:.1f}%",
                       delta=f"{mejora:+.1f} pts", delta_color="inverse")
 
+            mbc = bt.get("mape_by_cutoff", {})
+            if mbc:
+                st.markdown("**Error del ensemble según el día del mes en que se proyecta:**")
+                cc = st.columns(len(mbc))
+                for col, k in zip(cc, sorted(mbc)):
+                    col.metric(f"Día {k}", f"{mbc[k]:.1f}%")
+                st.caption("Cuantos más días transcurridos, menor el error. Te dice a partir de qué día del mes el pronóstico ya es confiable.")
+
             ow = bt["optimized_weights"]
             st.success(
                 "**Pesos óptimos sugeridos** (sobre los 4 factores extrapolables):  "
