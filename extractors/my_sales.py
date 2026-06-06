@@ -435,9 +435,9 @@ class MySalesExtractor:
         ensemble actual colapsan al factor 1 (igual que en producción),
         por eso el peso efectivo de proj1 es w1+w3+w4 = 0.50.
 
-        Para no chocar con el tope de 10.000 órdenes de get_orders, baja
-        la data mes por mes (con su ventana de 90 días) vía
-        get_orders_by_daterange.
+        Optimizado: baja el peso por día de la semana una sola vez y
+        cada mes a testear una sola vez (sin solapamientos), para
+        minimizar las llamadas a la API.
 
         Devuelve: MAPE por factor, MAPE del ensemble con los pesos
         actuales, y los pesos óptimos que minimizan el MAPE sobre estos
@@ -456,27 +456,44 @@ class MySalesExtractor:
                 m, y = 12, y - 1
             months.append((y, m))
 
+        # ── Peso por día de la semana: se calcula UNA sola vez ────
+        # (en vez de re-bajarlo por cada mes). El patrón semanal es
+        # estable, así que usar una ventana reciente única es buena
+        # aproximación y baja muchísimo las llamadas a la API.
+        wd_mult_global = {wd: 1.0 for wd in range(7)}
+        try:
+            df_wd = self.get_orders(120)
+            df_wd = df_wd[df_wd["status"] == "paid"].copy()
+            df_wd["date"] = df_wd["date_created"].dt.date
+            daily_wd = df_wd.groupby("date")["total_amount"].sum().reset_index()
+            daily_wd["wd"] = daily_wd["date"].apply(lambda d: d.weekday())
+            od = float(daily_wd["total_amount"].mean()) if not daily_wd.empty else 0.0
+            if od > 0:
+                for wd in range(7):
+                    sub = daily_wd[daily_wd["wd"] == wd]
+                    if not sub.empty:
+                        wd_mult_global[wd] = float(sub["total_amount"].mean()) / od
+        except Exception:
+            pass
+
         samples = []        # cada uno: [p1, p2, p5, p6, actual]
+        sample_cuts = []    # el día de corte K de cada muestra (paralelo a samples)
         tested_months = set()
 
         for (yy, mm) in months:
             dim     = calendar.monthrange(yy, mm)[1]
             m_start = date(yy, mm, 1)
             m_end   = date(yy, mm, dim)
-            win_start = m_start - timedelta(days=90)
 
+            # Solo el mes a testear (sin solapamiento entre meses)
             try:
-                df_span = self.get_orders_by_daterange(win_start, m_end)
+                df_m = self.get_orders_by_daterange(m_start, m_end)
             except Exception:
                 continue
-            if df_span.empty:
+            if df_m.empty or "date" not in df_m.columns:
                 continue
 
-            df_span = df_span[df_span["status"] == "paid"].copy()
-            if df_span.empty or "date" not in df_span.columns:
-                continue
-
-            df_m   = df_span[(df_span["date"] >= m_start) & (df_span["date"] <= m_end)]
+            df_m   = df_m[df_m["status"] == "paid"].copy()
             actual = float(df_m["total_amount"].sum())
             if actual <= 0:
                 continue
@@ -515,25 +532,14 @@ class MySalesExtractor:
                 accel = max(0.5, min(2.0, a3 / ap if ap > 0 else 1.0))
                 p5 = rev_sf + daily_avg * accel * days_rem
 
-                # Factor 6: forma intra-mes (ventana 90d previa al corte)
-                df_win = df_span[(df_span["date"] >= (cutoff - timedelta(days=90))) &
-                                 (df_span["date"] <  cutoff)]
-                wd_mult = {wd: 1.0 for wd in range(7)}
-                if not df_win.empty:
-                    daily_w = df_win.groupby("date")["total_amount"].sum().reset_index()
-                    daily_w["wd"] = daily_w["date"].apply(lambda d: d.weekday())
-                    od = float(daily_w["total_amount"].mean())
-                    if od > 0:
-                        for wd in range(7):
-                            sub = daily_w[daily_w["wd"] == wd]
-                            if not sub.empty:
-                                wd_mult[wd] = float(sub["total_amount"].mean()) / od
+                # Factor 6: forma intra-mes (usa el peso por día calculado una vez)
                 wr = 0.0
                 for dn in range(K + 1, dim + 1):
-                    wr += wd_mult.get(date(yy, mm, dn).weekday(), 1.0)
+                    wr += wd_mult_global.get(date(yy, mm, dn).weekday(), 1.0)
                 p6 = rev_sf + daily_avg * wr
 
                 samples.append([p1, p2, p5, p6, actual])
+                sample_cuts.append(K)
                 tested_months.add((yy, mm))
 
         if not samples:
@@ -572,6 +578,17 @@ class MySalesExtractor:
                     if mp < best_mape:
                         best_mape, best_w = mp, w
 
+        # MAPE del ensemble actual separado por día de corte.
+        # Dice a partir de qué día del mes el pronóstico ya es confiable.
+        cuts_arr = np.array(sample_cuts)
+        ens_pred = P @ w_cur
+        mape_by_cutoff = {}
+        for K in sorted(set(sample_cuts)):
+            mask = cuts_arr == K
+            if mask.any():
+                err = np.abs(ens_pred[mask] - y_true[mask]) / y_true[mask]
+                mape_by_cutoff[int(K)] = round(float(np.mean(err) * 100), 1)
+
         return {
             "samples":                 len(samples),
             "months_tested":           len(tested_months),
@@ -579,6 +596,7 @@ class MySalesExtractor:
             "factor_mape":             {k: round(v, 1) for k, v in factor_mape.items()},
             "ensemble_mape_current":   round(ens_cur, 1),
             "ensemble_mape_optimized": round(best_mape, 1),
+            "mape_by_cutoff":          mape_by_cutoff,
             "current_weights_eff":     {"proj1": 0.50, "proj2": 0.25, "proj5": 0.10, "proj6": 0.15},
             "optimized_weights":       {
                 "proj1": round(float(best_w[0]), 2),
