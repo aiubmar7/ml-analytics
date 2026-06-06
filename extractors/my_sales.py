@@ -224,14 +224,17 @@ class MySalesExtractor:
         days_elapsed   = today.day
         days_remaining = days_in_month - days_elapsed
 
-        df_month = self.get_orders(days_elapsed)
-        if df_month.empty:
+        # Un solo pull de 120 días para TODO el pronóstico: mes actual,
+        # mes previo, ventana del Factor 6 y nivel base salen de acá.
+        # Antes se bajaba en 3 pulls separados que se solapaban y
+        # enlentecían (a veces colgaban) la carga de la página.
+        df_all = self.get_orders(120)
+        if df_all is None or df_all.empty:
             return {"error": "Sin datos suficientes para proyectar"}
+        df_all = df_all[df_all["status"] == "paid"].copy()
+        df_all["date"] = df_all["date_created"].dt.date
 
-        df_paid = df_month[df_month["status"] == "paid"].copy()
-        df_paid["date"] = df_paid["date_created"].dt.date
-        df_paid = df_paid[df_paid["date"] >= date(today.year, today.month, 1)]
-
+        df_paid = df_all[df_all["date"] >= date(today.year, today.month, 1)].copy()
         if df_paid.empty:
             return {"error": "Sin ventas este mes todavia"}
 
@@ -264,12 +267,9 @@ class MySalesExtractor:
             prev_month  = today.month - 1 if today.month > 1 else 12
             prev_year   = today.year if today.month > 1 else today.year - 1
             prev_days   = calendar.monthrange(prev_year, prev_month)[1]
-            df_prev     = self.get_orders(days_elapsed + prev_days + 5)
-            df_prev_paid = df_prev[df_prev["status"] == "paid"].copy()
-            df_prev_paid["date"] = df_prev_paid["date_created"].dt.date
-            df_prev_paid = df_prev_paid[
-                (df_prev_paid["date"] >= date(prev_year, prev_month, 1)) &
-                (df_prev_paid["date"] <= date(prev_year, prev_month, prev_days))
+            df_prev_paid = df_all[
+                (df_all["date"] >= date(prev_year, prev_month, 1)) &
+                (df_all["date"] <= date(prev_year, prev_month, prev_days))
             ]
             prev_revenue = float(df_prev_paid["total_amount"].sum()) if not df_prev_paid.empty else None
         except Exception:
@@ -348,12 +348,8 @@ class MySalesExtractor:
         # toquen más (o menos) fines de semana / días fuertes que a los
         # días ya transcurridos del mes.
         wd_mult = {wd: 1.0 for wd in range(7)}  # 0=lunes .. 6=domingo
-        df_recent = None
+        df_recent = df_all   # mismo pull, ya filtrado a paid y con columna date
         try:
-            df_recent = self.get_orders(120)
-            df_recent = df_recent[df_recent["status"] == "paid"].copy()
-            df_recent["date"] = df_recent["date_created"].dt.date
-
             daily = df_recent.groupby("date").agg(
                 rev=("total_amount", "sum"),
                 un=("quantity", "sum"),
