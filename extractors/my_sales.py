@@ -33,6 +33,7 @@ class MySalesExtractor:
         self.client  = MLClient()
         self.storage = DropboxClient()
         self.user_id = None
+        self._orders_cache = {}   # {days_back: (timestamp, df)} cache con TTL
 
     def _get_user_id(self) -> str:
         if not self.user_id:
@@ -41,6 +42,15 @@ class MySalesExtractor:
         return self.user_id
 
     def get_orders(self, days_back: int = DEFAULT_DAYS_BACK) -> pd.DataFrame:
+        # Cache con TTL de 10 min: evita re-bajar la misma data en cada
+        # carga/refresco de la página (lo que martillaba la API y
+        # disparaba el rate limit). El objeto persiste entre reruns por
+        # el @st.cache_resource de get_clients() en app.py.
+        import time as _time
+        _cached = self._orders_cache.get(days_back)
+        if _cached and (_time.time() - _cached[0]) < 600:
+            return _cached[1]
+
         user_id   = self._get_user_id()
         date_from = (datetime.now() - timedelta(days=days_back)).strftime("%Y-%m-%dT00:00:00.000-03:00")
         logger.info(f"Extrayendo ordenes de los ultimos {days_back} dias...")
@@ -74,6 +84,7 @@ class MySalesExtractor:
         df["date_created"] = pd.to_datetime(df["date_created"])
         df["date_closed"]  = pd.to_datetime(df["date_closed"], errors="coerce")
         df["net_amount"]   = df["total_amount"] - df["sale_fee"]
+        self._orders_cache[days_back] = (_time.time(), df)
         return df
 
     def get_orders_by_daterange(self, date_from: date, date_to: date) -> pd.DataFrame:
