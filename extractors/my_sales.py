@@ -3,7 +3,16 @@ Extractor de ventas y métricas propias.
 """
 
 import logging
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta, date, timezone
+
+# Uruguay es UTC-3 fijo (sin horario de verano desde 2015). El servidor
+# de Streamlit corre en UTC, así que calculamos "hoy" en hora local de
+# Uruguay para que el día del mes no se adelante de noche.
+UY_TZ = timezone(timedelta(hours=-3))
+
+
+def _today_uy() -> date:
+    return datetime.now(UY_TZ).date()
 import calendar
 from pathlib import Path
 
@@ -210,7 +219,7 @@ class MySalesExtractor:
             return None
 
     def get_monthly_forecast(self) -> dict:
-        today          = date.today()
+        today          = _today_uy()
         days_in_month  = calendar.monthrange(today.year, today.month)[1]
         days_elapsed   = today.day
         days_remaining = days_in_month - days_elapsed
@@ -339,12 +348,13 @@ class MySalesExtractor:
         # toquen más (o menos) fines de semana / días fuertes que a los
         # días ya transcurridos del mes.
         wd_mult = {wd: 1.0 for wd in range(7)}  # 0=lunes .. 6=domingo
+        df_recent = None
         try:
-            df_hist90 = self.get_orders(90)
-            df_h = df_hist90[df_hist90["status"] == "paid"].copy()
-            df_h["date"] = df_h["date_created"].dt.date
+            df_recent = self.get_orders(120)
+            df_recent = df_recent[df_recent["status"] == "paid"].copy()
+            df_recent["date"] = df_recent["date_created"].dt.date
 
-            daily = df_h.groupby("date").agg(
+            daily = df_recent.groupby("date").agg(
                 rev=("total_amount", "sum"),
                 un=("quantity", "sum"),
                 ords=("order_id", "nunique"),
@@ -387,35 +397,39 @@ class MySalesExtractor:
         # A principio de mes el ensemble extrapola pocos días y es
         # inestable (el backtest lo confirma: ~24% de error a día 5).
         # Lo mezclamos con el nivel base reciente (promedio ponderado de
-        # los últimos 3 meses completos, vía API), con peso α que crece
-        # con los días transcurridos: temprano confía en el base, tarde
-        # en la extrapolación. α = días_transcurridos / días_del_mes.
+        # los últimos 3 meses completos), con peso α que crece con los
+        # días transcurridos: temprano confía en el base, tarde en la
+        # extrapolación. α = días_transcurridos / días_del_mes.
+        # IMPORTANTE: el nivel base sale del MISMO pull de 120 días del
+        # Factor 6, así que NO agrega llamadas a la API (no enlentece la
+        # carga de la página).
         baseline_revenue = baseline_units = baseline_orders = None
-        try:
-            b_rev, b_un, b_or = [], [], []
-            by, bm = today.year, today.month
-            for _ in range(3):              # 3 meses previos (nuevo -> viejo)
-                bm -= 1
-                if bm == 0:
-                    bm, by = 12, by - 1
-                bdim = calendar.monthrange(by, bm)[1]
-                dfb = self.get_orders_by_daterange(date(by, bm, 1), date(by, bm, bdim))
-                if not dfb.empty:
-                    dfb = dfb[dfb["status"] == "paid"]
+        if df_recent is not None and not df_recent.empty:
+            try:
+                b_rev, b_un, b_or = [], [], []
+                by, bm = today.year, today.month
+                for _ in range(3):              # 3 meses previos (nuevo -> viejo)
+                    bm -= 1
+                    if bm == 0:
+                        bm, by = 12, by - 1
+                    bdim = calendar.monthrange(by, bm)[1]
+                    mask = ((df_recent["date"] >= date(by, bm, 1)) &
+                            (df_recent["date"] <= date(by, bm, bdim)))
+                    dfb = df_recent[mask]
                     tot = float(dfb["total_amount"].sum())
                     if tot > 0:
                         b_rev.append(tot)
                         b_un.append(int(dfb["quantity"].sum()))
                         b_or.append(dfb["order_id"].nunique())
-            if b_rev:
-                # pesos por recencia: el mes más reciente pesa más (3,2,1)
-                ws = list(range(len(b_rev), 0, -1))   # ej. [3,2,1]
-                sw = float(sum(ws))
-                baseline_revenue = sum(w * v for w, v in zip(ws, b_rev)) / sw
-                baseline_units   = sum(w * v for w, v in zip(ws, b_un))  / sw
-                baseline_orders  = sum(w * v for w, v in zip(ws, b_or))  / sw
-        except Exception:
-            pass
+                if b_rev:
+                    # pesos por recencia: el mes más reciente pesa más (3,2,1)
+                    ws = list(range(len(b_rev), 0, -1))
+                    sw = float(sum(ws))
+                    baseline_revenue = sum(w * v for w, v in zip(ws, b_rev)) / sw
+                    baseline_units   = sum(w * v for w, v in zip(ws, b_un))  / sw
+                    baseline_orders  = sum(w * v for w, v in zip(ws, b_or))  / sw
+            except Exception:
+                pass
 
         blend_alpha = days_elapsed / days_in_month
         if baseline_revenue and baseline_revenue > 0:
@@ -490,7 +504,7 @@ class MySalesExtractor:
         """
         import numpy as np
 
-        today = date.today()
+        today = _today_uy()
 
         # Meses completos a testear (excluye el mes actual)
         months = []
