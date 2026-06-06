@@ -77,6 +77,10 @@ class MLClient:
         }
 
         url = f"{self.base_url}{endpoint}"
+        # Timeout para que una request colgada no congele la app para
+        # siempre: (conexión 10s, lectura 20s). Si el server no responde,
+        # tira excepción visible en vez de quedar esperando indefinido.
+        kwargs.setdefault("timeout", (10, 20))
         resp = self.session.request(method, url, headers=headers, **kwargs)
 
         # Log útil para debugging
