@@ -241,6 +241,16 @@ if page == "🏠 Resumen":
         with ac3:
             st.metric("Promedio diario (últ. 7d)", fmt_currency(forecast["daily_trend_revenue"]))
 
+        if forecast.get("baseline_revenue"):
+            a = forecast.get("blend_alpha", 0.0)
+            st.caption(
+                f"🧭 Pronóstico ajustado con blend por confianza: "
+                f"{a:.0%} extrapolación del mes + {1 - a:.0%} nivel base "
+                f"({fmt_currency(forecast['baseline_revenue'])}, prom. últ. 3 meses). "
+                f"Antes del blend daba {fmt_currency(forecast.get('ensemble_revenue', 0))}. "
+                f"A principio de mes se apoya más en el nivel base; sobre fin de mes, casi todo en la data real."
+            )
+
         with st.expander("🔍 Detalle del cálculo (6 factores)"):
             d1, d2, d3 = st.columns(3)
             with d1:
@@ -305,13 +315,25 @@ if page == "🏠 Resumen":
             e2.metric("Ensemble óptimo", f"{bt['ensemble_mape_optimized']:.1f}%",
                       delta=f"{mejora:+.1f} pts", delta_color="inverse")
 
-            mbc = bt.get("mape_by_cutoff", {})
+            mbc  = bt.get("mape_by_cutoff", {})
+            mbcb = bt.get("mape_by_cutoff_blend", {})
             if mbc:
-                st.markdown("**Error del ensemble según el día del mes en que se proyecta:**")
+                st.markdown("**Error por día del mes — sin blend vs con blend:**")
                 cc = st.columns(len(mbc))
                 for col, k in zip(cc, sorted(mbc)):
-                    col.metric(f"Día {k}", f"{mbc[k]:.1f}%")
-                st.caption("Cuantos más días transcurridos, menor el error. Te dice a partir de qué día del mes el pronóstico ya es confiable.")
+                    cur = mbc[k]
+                    bl  = mbcb.get(k)
+                    if bl is not None:
+                        col.metric(f"Día {k}", f"{bl:.1f}%",
+                                   delta=f"{bl - cur:+.1f} vs sin blend", delta_color="inverse")
+                    else:
+                        col.metric(f"Día {k}", f"{cur:.1f}%")
+                eb = bt.get("ensemble_mape_blend")
+                if eb is not None:
+                    st.caption(
+                        f"Global: sin blend {bt['ensemble_mape_current']:.1f}% → con blend {eb:.1f}%. "
+                        "El blend ataca sobre todo los días tempranos (5-10), que es donde el pronóstico erraba más."
+                    )
 
             ow = bt["optimized_weights"]
             st.success(
