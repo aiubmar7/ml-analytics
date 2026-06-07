@@ -1,17 +1,9 @@
-# API y HTTP
-requests>=2.31.0
-urllib3>=2.0.0
-
-# Data
-pandas>=2.0.0
-pyarrow>=14.0.0
-
-# Dropbox
-dropbox>=11.36.0
-
-# Dashboard
-streamlit>=1.30.0
-plotly>=5.18.0
-
-# Config
-python-dotenv>=1.0.0
+requests==2.32.3
+urllib3==2.2.3
+pandas==2.2.3
+numpy==1.26.4
+pyarrow==16.1.0
+dropbox==12.0.2
+streamlit==1.40.2
+plotly==5.24.1
+python-dotenv==1.0.1
