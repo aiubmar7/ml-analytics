@@ -1,712 +1,860 @@
 """
-Extractor de ventas y métricas propias.
+Dashboard principal - Streamlit.
 """
 
-import logging
-from datetime import datetime, timedelta, date, timezone
-
-# Uruguay es UTC-3 fijo (sin horario de verano desde 2015). El servidor
-# de Streamlit corre en UTC, así que calculamos "hoy" en hora local de
-# Uruguay para que el día del mes no se adelante de noche.
-UY_TZ = timezone(timedelta(hours=-3))
-
-
-def _today_uy() -> date:
-    return datetime.now(UY_TZ).date()
-import calendar
-from pathlib import Path
-
-import pandas as pd
-
 import sys
-sys.path.append(str(Path(__file__).parent.parent))
+import logging
+from pathlib import Path
+from datetime import datetime, date
+import calendar
+
+import sys as _sys
+from pathlib import Path as _Path
+_ROOT = _Path(__file__).resolve().parent.parent
+if str(_ROOT) not in _sys.path:
+    _sys.path.insert(0, str(_ROOT))
+
+import streamlit as st
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+from auth.ml_auth import get_valid_access_token
 from auth.ml_client import MLClient
+from extractors.my_sales import MySalesExtractor
+from extractors.competition import CompetitionExtractor
+from extractors.competitor_tracker import CompetitorTracker
+from extractors.categories import CategoriesExtractor
+from extractors.keywords import KeywordsExtractor
 from storage.dropbox_client import DropboxClient
-from config import DEFAULT_DAYS_BACK
 
-logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
 
+st.set_page_config(
+    page_title="ML Analytics",
+    page_icon="📊",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
-class MySalesExtractor:
+st.markdown("""
+<style>
+@import url('https://fonts.cdnfonts.com/css/samsung-sans');
+html, body, [class*="css"], p, div, span, label, input, button {
+    font-family: 'Samsung Sans', sans-serif !important;
+    font-size: 14px !important;
+}
+h1 { font-size: 24px !important; }
+h2 { font-size: 20px !important; }
+h3 { font-size: 17px !important; }
+[data-testid="metric-container"] label { font-size: 13px !important; }
+[data-testid="metric-container"] [data-testid="stMetricValue"] { font-size: 20px !important; }
+</style>
+""", unsafe_allow_html=True)
 
-    def __init__(self):
-        self.client  = MLClient()
-        self.storage = DropboxClient()
-        self.user_id = None
+@st.cache_resource
+def get_clients():
+    return {
+        "sales":       MySalesExtractor(),
+        "competition": CompetitionExtractor(),
+        "categories":  CategoriesExtractor(),
+        "keywords":    KeywordsExtractor(),
+        "storage":     DropboxClient(),
+    }
 
-    def _get_user_id(self) -> str:
-        if not self.user_id:
-            me = self.client.get_my_user()
-            self.user_id = str(me["id"])
-        return self.user_id
+st.sidebar.title("📊 ML Analytics")
+st.sidebar.markdown("---")
 
-    def get_orders(self, days_back: int = DEFAULT_DAYS_BACK) -> pd.DataFrame:
-        user_id   = self._get_user_id()
-        date_from = (datetime.now() - timedelta(days=days_back)).strftime("%Y-%m-%dT00:00:00.000-03:00")
-        logger.info(f"Extrayendo ordenes de los ultimos {days_back} dias...")
-        orders = []
-        for order in self.client.get_all_pages(
-            "/orders/search",
-            params={"seller": user_id, "sort": "date_desc", "order.date_created.from": date_from, "offset": 0},
-            results_key="results",
-            max_items=10000,
-        ):
-            for item in order.get("order_items", []):
-                orders.append({
-                    "order_id":       order["id"],
-                    "date_created":   order["date_created"],
-                    "date_closed":    order.get("date_closed"),
-                    "status":         order["status"],
-                    "total_amount":   order["total_amount"],
-                    "currency_id":    order["currency_id"],
-                    "item_id":        item["item"]["id"],
-                    "item_title":     item["item"]["title"],
-                    "quantity":       item["quantity"],
-                    "unit_price":     item["unit_price"],
-                    "sale_fee":       item.get("sale_fee", 0),
-                    "buyer_id":       order.get("buyer", {}).get("id"),
-                    "buyer_nickname": order.get("buyer", {}).get("nickname"),
-                    "shipping_id":    order.get("shipping", {}).get("id"),
-                })
-        if not orders:
-            return pd.DataFrame()
-        df = pd.DataFrame(orders)
-        df["date_created"] = pd.to_datetime(df["date_created"])
-        df["date_closed"]  = pd.to_datetime(df["date_closed"], errors="coerce")
-        df["net_amount"]   = df["total_amount"] - df["sale_fee"]
-        return df
+page = st.sidebar.radio(
+    "Módulo",
+    ["🏠 Resumen", "💰 Mis Ventas", "📊 Reportes", "🗄️ Historial", "🔍 Competencia", "📈 Tendencias", "🔑 Keywords"],
+)
 
-    def get_orders_by_daterange(self, date_from: date, date_to: date) -> pd.DataFrame:
-        user_id  = self._get_user_id()
-        from_str = date_from.strftime("%Y-%m-%dT00:00:00.000-03:00")
-        to_str   = date_to.strftime("%Y-%m-%dT23:59:59.000-03:00")
-        logger.info(f"Extrayendo ordenes del {date_from} al {date_to}...")
-        orders = []
-        for order in self.client.get_all_pages(
-            "/orders/search",
-            params={
-                "seller": user_id,
-                "sort": "date_desc",
-                "order.date_created.from": from_str,
-                "order.date_created.to":   to_str,
-                "offset": 0,
-            },
-            results_key="results",
-            max_items=10000,
-        ):
-            for item in order.get("order_items", []):
-                orders.append({
-                    "order_id":     order["id"],
-                    "date_created": order["date_created"],
-                    "status":       order["status"],
-                    "total_amount": order["total_amount"],
-                    "currency_id":  order["currency_id"],
-                    "item_id":      item["item"]["id"],
-                    "item_title":   item["item"]["title"],
-                    "quantity":     item["quantity"],
-                    "unit_price":   item["unit_price"],
-                    "sale_fee":     item.get("sale_fee", 0),
-                })
-        if not orders:
-            return pd.DataFrame()
-        df = pd.DataFrame(orders)
-        df["date_created"] = pd.to_datetime(df["date_created"])
-        df["net_amount"]   = df["total_amount"] - df["sale_fee"]
-        df["date"]         = df["date_created"].dt.date
-        return df
+st.sidebar.markdown("---")
+days_back = st.sidebar.slider("Días a analizar", 7, 90, 30)
+st.sidebar.markdown(f"*Período: últimos {days_back} días*")
 
-    def get_period_summary(self, date_from: date, date_to: date) -> dict:
-        df = self.get_orders_by_daterange(date_from, date_to)
-        if df.empty:
-            return {"revenue": 0, "net": 0, "orders": 0, "units": 0, "avg_ticket": 0, "df": df}
-        df_paid = df[df["status"] == "paid"]
-        return {
-            "revenue":    round(float(df_paid["total_amount"].sum()), 2),
-            "net":        round(float(df_paid["net_amount"].sum()), 2),
-            "orders":     df_paid["order_id"].nunique(),
-            "units":      int(df_paid["quantity"].sum()),
-            "avg_ticket": round(float(df_paid["total_amount"].mean()), 2) if not df_paid.empty else 0,
-            "df":         df_paid,
-        }
+def fmt_currency(value: float, currency: str = "UYU") -> str:
+    return f"${value:,.0f} {currency}"
 
-    def sync_orders(self, days_back: int = DEFAULT_DAYS_BACK) -> pd.DataFrame:
-        df = self.get_orders(days_back)
-        if not df.empty:
-            month_str = datetime.now().strftime("%Y-%m")
-            path = f"data/my_sales/orders_{month_str}.parquet"
-            self.storage.append_dataframe(df, path)
-            self.storage.log_sync("my_sales", "ok", {"rows": len(df)})
-        return df
+def show_period_detail(summary: dict, label: str):
+    if summary["revenue"] == 0:
+        st.warning(f"Sin datos para {label}. Cargá el historial desde 🗄️ Historial.")
+        return
+    df = summary["df"]
+    if df.empty:
+        return
 
-    def get_my_items(self) -> pd.DataFrame:
-        user_id = self._get_user_id()
-        item_ids = list(self.client.get_all_pages(f"/users/{user_id}/items/search", results_key="results"))
-        if not item_ids:
-            return pd.DataFrame()
-        items_data = self.client.get_items_bulk(item_ids)
-        rows = []
-        for item in items_data:
-            rows.append({
-                "item_id":       item["id"],
-                "title":         item["title"],
-                "category_id":   item["category_id"],
-                "price":         item["price"],
-                "currency_id":   item["currency_id"],
-                "available_qty": item.get("available_quantity", 0),
-                "sold_qty":      item.get("sold_quantity", 0),
-                "status":        item["status"],
-                "listing_type":  item.get("listing_type_id"),
-                "condition":     item.get("condition"),
-                "permalink":     item.get("permalink"),
-                "date_created":  item.get("date_created"),
-                "last_updated":  item.get("last_updated"),
-                "health":        item.get("health"),
-            })
-        return pd.DataFrame(rows)
+    st.markdown(f"##### {label}")
+    k1, k2, k3, k4, k5 = st.columns(5)
+    k1.metric("Facturación", fmt_currency(summary["revenue"]))
+    k2.metric("Neto", fmt_currency(summary["net"]))
+    k3.metric("Órdenes", f"{summary['orders']:,}")
+    k4.metric("Unidades", f"{summary['units']:,}")
+    k5.metric("Ticket prom.", fmt_currency(summary["avg_ticket"]))
 
-    def sync_my_items(self) -> pd.DataFrame:
-        df = self.get_my_items()
-        if not df.empty:
-            month_str = datetime.now().strftime("%Y-%m")
-            self.storage.save_dataframe(df, f"data/my_sales/items_{month_str}.parquet")
-        return df
+    tab_un, tab_din, tab_pareto = st.tabs(["📦 Top 10 por unidades", "💰 Top 10 por facturación", "📊 Pareto"])
 
-    def get_my_reputation(self) -> dict:
+    with tab_un:
+        top_units = (
+            df.groupby("item_title")["quantity"].sum()
+            .sort_values(ascending=False).head(10)
+            .reset_index().rename(columns={"item_title": "Producto", "quantity": "Unidades"})
+        )
+        fig = px.bar(top_units, x="Unidades", y="Producto", orientation="h",
+                     color_discrete_sequence=["#3483FA"])
+        fig.update_layout(plot_bgcolor="rgba(0,0,0,0)", yaxis={"categoryorder": "total ascending"})
+        st.plotly_chart(fig, use_container_width=True)
+
+    with tab_din:
+        top_rev = (
+            df.groupby("item_title")["total_amount"].sum()
+            .sort_values(ascending=False).head(10)
+            .reset_index().rename(columns={"item_title": "Producto", "total_amount": "Facturación"})
+        )
+        fig2 = px.bar(top_rev, x="Facturación", y="Producto", orientation="h",
+                      color_discrete_sequence=["#FFE600"])
+        fig2.update_layout(plot_bgcolor="rgba(0,0,0,0)", yaxis={"categoryorder": "total ascending"})
+        st.plotly_chart(fig2, use_container_width=True)
+
+    with tab_pareto:
+        pareto = (
+            df.groupby("item_title")["total_amount"].sum()
+            .sort_values(ascending=False).reset_index()
+        )
+        pareto["acumulado"]     = pareto["total_amount"].cumsum()
+        pareto["pct_acumulado"] = pareto["acumulado"] / pareto["total_amount"].sum() * 100
+        pareto["rank"]          = range(1, len(pareto) + 1)
+
+        corte_80       = pareto[pareto["pct_acumulado"] <= 80]
+        n_productos_80 = len(corte_80)
+        pct_prod_80    = round(n_productos_80 / len(pareto) * 100, 1)
+
+        st.info(f"**{n_productos_80} productos** ({pct_prod_80}% del catálogo) generan el **80% de los ingresos**")
+
+        fig3 = px.bar(pareto.head(20), x="item_title", y="total_amount",
+                      title="Pareto — Top 20 productos",
+                      labels={"item_title": "Producto", "total_amount": "Facturación"},
+                      color_discrete_sequence=["#3483FA"])
+        fig3.add_scatter(x=pareto.head(20)["item_title"], y=pareto.head(20)["pct_acumulado"],
+                         mode="lines+markers", name="% Acumulado", yaxis="y2",
+                         line=dict(color="#FFE600", width=2))
+        fig3.update_layout(
+            plot_bgcolor="rgba(0,0,0,0)",
+            xaxis_tickangle=-45,
+            yaxis2=dict(title="% Acumulado", overlaying="y", side="right", range=[0, 105]),
+        )
+        st.plotly_chart(fig3, use_container_width=True)
+
+        st.dataframe(
+            pareto[["rank", "item_title", "total_amount", "pct_acumulado"]].head(20)
+            .rename(columns={"rank": "#", "item_title": "Producto", "total_amount": "Facturación", "pct_acumulado": "% Acumulado"})
+            .assign(Facturación=lambda x: x["Facturación"].apply(fmt_currency)),
+            use_container_width=True, hide_index=True
+        )
+
+# ══════════════════════════════════════════════════════════════════
+# PÁGINA: RESUMEN
+# ══════════════════════════════════════════════════════════════════
+
+if page == "🏠 Resumen":
+    st.title("🏠 Resumen Ejecutivo")
+    clients = get_clients()
+
+    with st.spinner("Cargando datos..."):
         try:
-            user_id = self._get_user_id()
-            data    = self.client.get(f"/users/{user_id}/seller_reputation")
-            return {
-                "level_id":               data.get("level_id"),
-                "power_seller_status":    data.get("power_seller_status"),
-                "transactions_total":     data.get("transactions", {}).get("total", 0),
-                "transactions_completed": data.get("transactions", {}).get("completed", 0),
-                "claims_rate":            data.get("metrics", {}).get("claims", {}).get("rate", 0),
-                "delayed_handling_rate":  data.get("metrics", {}).get("delayed_handling_time", {}).get("rate", 0),
-                "cancellations_rate":     data.get("metrics", {}).get("cancellations", {}).get("rate", 0),
-            }
+            summary = clients["sales"].get_summary(days_back)
         except Exception as e:
-            logger.warning(f"No se pudo obtener reputacion: {e}")
-            return {"level_id": "Sin datos", "power_seller_status": "Sin datos", "claims_rate": 0}
+            st.error(f"Error al cargar datos: {e}")
+            st.info("Asegurate de haber completado la autorización (`python auth/ml_auth.py`)")
+            st.stop()
 
-    def get_summary(self, days_back: int = 30) -> dict:
-        df = self.get_orders(days_back)
-        if df.empty:
-            return {"error": "Sin datos de ventas"}
-        df_paid = df[df["status"] == "paid"]
-        return {
-            "period_days":   days_back,
-            "total_orders":  df_paid["order_id"].nunique(),
-            "total_units":   int(df_paid["quantity"].sum()),
-            "total_revenue": round(float(df_paid["total_amount"].sum()), 2),
-            "net_revenue":   round(float(df_paid["net_amount"].sum()), 2),
-            "avg_ticket":    round(float(df_paid["total_amount"].mean()), 2) if not df_paid.empty else 0,
-            "top_item":      df_paid.groupby("item_title")["quantity"].sum().idxmax() if not df_paid.empty else None,
-            "reputation":    self.get_my_reputation(),
-        }
+    if "error" in summary:
+        st.warning(summary["error"])
+        st.stop()
 
-    def _load_historical_month(self, year: int, month: int) -> pd.DataFrame:
-        """Carga un mes desde Dropbox historial."""
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("Órdenes", summary["total_orders"])
+    with col2:
+        st.metric("Unidades vendidas", summary["total_units"])
+    with col3:
+        st.metric("Ingresos brutos", fmt_currency(summary["total_revenue"]))
+    with col4:
+        st.metric("Ingresos netos", fmt_currency(summary["net_revenue"]))
+
+    st.markdown("---")
+    col_left, col_right = st.columns(2)
+
+    with col_left:
+        st.subheader("Reputación")
+        rep = summary.get("reputation", {})
+        st.metric("Nivel", rep.get("level_id", "—").replace("_", " ").title())
+        st.metric("Power Seller", rep.get("power_seller_status", "—"))
+        claims_rate = rep.get("claims_rate", 0) * 100
+        color = "🟢" if claims_rate < 2 else "🟡" if claims_rate < 5 else "🔴"
+        st.metric(f"Tasa de reclamos {color}", f"{claims_rate:.2f}%")
+
+    with col_right:
+        st.subheader("Producto estrella")
+        if summary.get("top_item"):
+            st.info(f"**{summary['top_item']}**")
+        st.metric("Ticket promedio", fmt_currency(summary.get("avg_ticket", 0)))
+
+    st.markdown("---")
+    st.subheader("📅 Pronóstico de facturación mensual")
+
+    with st.spinner("Calculando pronóstico..."):
         try:
-            path = f"data/historical/{year:04d}-{month:02d}.parquet"
-            df = self.storage.load_dataframe(path)
-            if df is not None and not df.empty:
-                df["date_created"] = pd.to_datetime(df["date_created"])
-                df["date"] = df["date_created"].dt.date
-                if "net_amount" not in df.columns:
-                    df["net_amount"] = df["total_amount"] - df.get("sale_fee", 0)
-            return df
-        except Exception:
-            return None
+            forecast = clients["sales"].get_monthly_forecast()
+        except Exception as e:
+            forecast = {"error": str(e)}
 
-    def get_monthly_forecast(self) -> dict:
-        today          = _today_uy()
-        days_in_month  = calendar.monthrange(today.year, today.month)[1]
-        days_elapsed   = today.day
-        days_remaining = days_in_month - days_elapsed
+    if "error" in forecast:
+        st.warning(f"No se pudo calcular el pronóstico: {forecast['error']}")
+    else:
+        elapsed    = forecast["days_elapsed"]
+        remaining  = forecast["days_remaining"]
+        total_days = forecast["days_in_month"]
 
-        df_month = self.get_orders(days_elapsed)
-        if df_month.empty:
-            return {"error": "Sin datos suficientes para proyectar"}
+        st.caption(f"📆 {forecast['month']} — día {elapsed} de {total_days} ({remaining} días restantes)")
+        st.progress(elapsed / total_days, text=f"Progreso del mes: {elapsed}/{total_days} días")
 
-        df_paid = df_month[df_month["status"] == "paid"].copy()
-        df_paid["date"] = df_paid["date_created"].dt.date
-        df_paid = df_paid[df_paid["date"] >= date(today.year, today.month, 1)]
+        st.markdown("#### Proyección final del mes")
+        fc1, fc2, fc3, fc4 = st.columns(4)
+        with fc1:
+            delta_rev = f"{forecast['vs_prev_month_pct']:+.1f}% vs mes ant." if forecast.get("vs_prev_month_pct") is not None else None
+            st.metric("💰 Facturación proyectada", fmt_currency(forecast["forecast_revenue"]), delta=delta_rev)
+        with fc2:
+            st.metric("📦 Unidades proyectadas", f"{int(forecast['forecast_units']):,}")
+        with fc3:
+            st.metric("🛒 Órdenes proyectadas", f"{int(forecast['forecast_orders']):,}")
+        with fc4:
+            st.metric("💵 Neto proyectado", fmt_currency(forecast["forecast_net"]))
 
-        if df_paid.empty:
-            return {"error": "Sin ventas este mes todavia"}
+        st.markdown("#### Acumulado real vs proyección")
+        ac1, ac2, ac3 = st.columns(3)
+        with ac1:
+            pct_done = round(forecast["revenue_so_far"] / forecast["forecast_revenue"] * 100, 1) if forecast["forecast_revenue"] > 0 else 0
+            st.metric("Facturado hasta hoy", fmt_currency(forecast["revenue_so_far"]), delta=f"{pct_done}% del objetivo")
+        with ac2:
+            st.metric("Promedio diario (mes)", fmt_currency(forecast["daily_avg_revenue"]))
+        with ac3:
+            st.metric("Promedio diario (últ. 7d)", fmt_currency(forecast["daily_trend_revenue"]))
 
-        revenue_so_far = float(df_paid["total_amount"].sum())
-        units_so_far   = int(df_paid["quantity"].sum())
-        orders_so_far  = df_paid["order_id"].nunique()
-        net_so_far     = float(df_paid["net_amount"].sum())
+        if forecast.get("baseline_revenue"):
+            a = forecast.get("blend_alpha", 0.0)
+            st.caption(
+                f"🧭 Pronóstico ajustado con blend por confianza: "
+                f"{a:.0%} extrapolación del mes + {1 - a:.0%} nivel base "
+                f"({fmt_currency(forecast['baseline_revenue'])}, prom. últ. 3 meses). "
+                f"Antes del blend daba {fmt_currency(forecast.get('ensemble_revenue', 0))}. "
+                f"A principio de mes se apoya más en el nivel base; sobre fin de mes, casi todo en la data real."
+            )
 
-        daily_avg_revenue = revenue_so_far / days_elapsed
-        daily_avg_units   = units_so_far   / days_elapsed
-        daily_avg_orders  = orders_so_far  / days_elapsed
+        with st.expander("🔍 Detalle del cálculo (6 factores)"):
+            d1, d2, d3 = st.columns(3)
+            with d1:
+                st.metric("1️⃣ Promedio diario del mes", fmt_currency(forecast["proj_daily_avg"]), help="Peso: 15%")
+            with d2:
+                st.metric("2️⃣ Tendencia últimos 7 días", fmt_currency(forecast["proj_trend_7d"]), help="Peso: 25%")
+            with d3:
+                ly = forecast.get("last_year_revenue")
+                st.metric("3️⃣ Mismo mes año anterior", fmt_currency(ly) if ly else "Sin datos", help="Peso: 20%")
+            d4, d5, d6 = st.columns(3)
+            with d4:
+                seasonal = forecast.get("proj_seasonal")
+                yrs = forecast.get("seasonal_years", 0)
+                label = f"4️⃣ Estacionalidad ({yrs} años)" if yrs > 0 else "4️⃣ Estacionalidad histórica"
+                st.metric(label, fmt_currency(seasonal) if seasonal else "Sin datos", help="Peso: 15%")
+            with d5:
+                acc = forecast.get("acceleration_factor", 1.0)
+                arrow = "📈" if acc > 1 else "📉" if acc < 1 else "➡️"
+                st.metric("5️⃣ Velocidad de crecimiento", fmt_currency(forecast.get("proj_acceleration", 0)),
+                          delta=f"{arrow} Factor: {acc:.2f}x", help="Peso: 10%")
+            with d6:
+                shape = forecast.get("calendar_shape_pct", 0.0)
+                arrow6 = "📈" if shape > 0 else "📉" if shape < 0 else "➡️"
+                st.metric("6️⃣ Forma intra-mes (días)", fmt_currency(forecast.get("proj_calendar", 0)),
+                          delta=f"{arrow6} {shape:+.1f}% vs plano", help="Peso: 15%")
+            if forecast.get("vs_last_year_pct") is not None:
+                st.info(f"📊 Crecimiento vs mismo mes del año anterior: **{forecast['vs_last_year_pct']:+.1f}%**")
 
-        # ── Factor 1: Promedio diario del mes (25%) ───────────────
-        proj1_revenue = revenue_so_far + (daily_avg_revenue * days_remaining)
-        proj1_units   = units_so_far   + (daily_avg_units   * days_remaining)
-        proj1_orders  = orders_so_far  + (daily_avg_orders  * days_remaining)
+    # ── Backtest del pronóstico (recalibración de pesos) ──────────
+    st.markdown("---")
+    st.subheader("🎯 Backtest del pronóstico (MAPE)")
+    st.caption("Re-corre la proyección como si fuera el día X de meses pasados y mide el error % real de cada factor. Sirve para recalibrar los pesos con datos en vez de a ojo.")
 
-        # ── Factor 2: Tendencia últimos 7 días (30%) ──────────────
-        last7 = df_paid[df_paid["date"] >= (today - timedelta(days=6))]
-        days7 = max(len(last7["date"].unique()), 1)
-        daily_trend_revenue = float(last7["total_amount"].sum()) / days7
-        daily_trend_units   = float(last7["quantity"].sum())     / days7
-        daily_trend_orders  = last7["order_id"].nunique()        / days7
-        proj2_revenue = revenue_so_far + (daily_trend_revenue * days_remaining)
-        proj2_units   = units_so_far   + (daily_trend_units   * days_remaining)
-        proj2_orders  = orders_so_far  + (daily_trend_orders  * days_remaining)
+    bt_col1, _bt_col2 = st.columns([1, 2])
+    with bt_col1:
+        bt_months = st.selectbox("Meses a testear", [3, 4, 6], index=2)
+    run_bt = st.button("▶️ Correr backtest (tarda ~30-60s)")
 
-        # ── Factor 3: Mismo mes año anterior (20%) ────────────────
-        try:
+    if run_bt:
+        with st.spinner("Bajando meses anteriores y replayando proyecciones..."):
+            try:
+                bt = clients["sales"].backtest_forecast(months_back=bt_months, cutoffs=(5, 10, 15, 20))
+            except Exception as e:
+                bt = {"error": str(e)}
+
+        if "error" in bt:
+            st.warning(f"No se pudo correr el backtest: {bt['error']}")
+        elif bt.get("samples", 0) == 0:
+            st.warning("No hay meses cerrados con datos suficientes en la ventana de la API.")
+        else:
+            st.caption(f"Basado en {bt['samples']} muestras · {bt['months_tested']} meses · cortes en días {bt['cutoffs']}")
+            f = bt["factor_mape"]
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("1️⃣ Promedio diario", f"{f['proj1']:.1f}%", help="Error medio del factor por sí solo")
+            c2.metric("2️⃣ Tendencia 7d", f"{f['proj2']:.1f}%")
+            c3.metric("5️⃣ Velocidad", f"{f['proj5']:.1f}%")
+            c4.metric("6️⃣ Forma intra-mes", f"{f['proj6']:.1f}%")
+
+            e1, e2 = st.columns(2)
+            e1.metric("Ensemble actual", f"{bt['ensemble_mape_current']:.1f}%")
+            mejora = bt["ensemble_mape_optimized"] - bt["ensemble_mape_current"]
+            e2.metric("Ensemble óptimo", f"{bt['ensemble_mape_optimized']:.1f}%",
+                      delta=f"{mejora:+.1f} pts", delta_color="inverse")
+
+            mbc  = bt.get("mape_by_cutoff", {})
+            mbcb = bt.get("mape_by_cutoff_blend", {})
+            if mbc:
+                st.markdown("**Error por día del mes — sin blend vs con blend:**")
+                cc = st.columns(len(mbc))
+                for col, k in zip(cc, sorted(mbc)):
+                    cur = mbc[k]
+                    bl  = mbcb.get(k)
+                    if bl is not None:
+                        col.metric(f"Día {k}", f"{bl:.1f}%",
+                                   delta=f"{bl - cur:+.1f} vs sin blend", delta_color="inverse")
+                    else:
+                        col.metric(f"Día {k}", f"{cur:.1f}%")
+                eb = bt.get("ensemble_mape_blend")
+                if eb is not None:
+                    st.caption(
+                        f"Global: sin blend {bt['ensemble_mape_current']:.1f}% → con blend {eb:.1f}%. "
+                        "El blend ataca sobre todo los días tempranos (5-10), que es donde el pronóstico erraba más."
+                    )
+
+            ow = bt["optimized_weights"]
+            st.success(
+                "**Pesos óptimos sugeridos** (sobre los 4 factores extrapolables):  "
+                f"P1 {ow['proj1']:.0%} · P2 {ow['proj2']:.0%} · P5 {ow['proj5']:.0%} · P6 {ow['proj6']:.0%}"
+            )
+            st.caption(
+                "Los factores 3 (año anterior) y 4 (estacionalidad) no se backtestean: no hay histórico en Dropbox, "
+                "hoy colapsan al factor 1. Para aplicarlos, en get_monthly_forecast poné w2/w5/w6 con estos valores y "
+                "repartí el peso de P1 entre w1 (y w3/w4 cuando cargues histórico)."
+            )
+
+
+# ══════════════════════════════════════════════════════════════════
+# PÁGINA: MIS VENTAS
+# ══════════════════════════════════════════════════════════════════
+
+elif page == "💰 Mis Ventas":
+    st.title("💰 Mis Ventas")
+    clients = get_clients()
+
+    col_btn1, _ = st.columns([1, 4])
+    with col_btn1:
+        refresh = st.button("🔄 Actualizar datos")
+
+    with st.spinner("Extrayendo órdenes de ML..."):
+        if refresh:
+            df = clients["sales"].sync_orders(days_back)
+        else:
+            month_str = datetime.now().strftime("%Y-%m")
+            df = clients["storage"].load_dataframe(f"data/my_sales/orders_{month_str}.parquet")
+            if df is None:
+                df = clients["sales"].sync_orders(days_back)
+
+    if df is None or df.empty:
+        st.warning("No hay datos de ventas disponibles.")
+        st.stop()
+
+    df_paid = df[df["status"] == "paid"].copy()
+
+    st.subheader("Ventas diarias")
+    df_paid["date"] = df_paid["date_created"].dt.date
+    daily = df_paid.groupby("date").agg(
+        total_amount=("total_amount", "sum"),
+        orders=("order_id", "nunique"),
+    ).reset_index()
+
+    fig = px.bar(daily, x="date", y="total_amount",
+                 labels={"date": "Fecha", "total_amount": "Ingresos"},
+                 color_discrete_sequence=["#FFE600"])
+    fig.update_layout(plot_bgcolor="rgba(0,0,0,0)")
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.subheader("Top productos por ingresos")
+    top_items = (
+        df_paid.groupby("item_title")
+        .agg(total=("total_amount", "sum"), units=("quantity", "sum"))
+        .sort_values("total", ascending=False)
+        .head(10)
+        .reset_index()
+    )
+    fig2 = px.bar(top_items, x="total", y="item_title", orientation="h",
+                  labels={"total": "Ingresos", "item_title": "Producto"},
+                  color_discrete_sequence=["#3483FA"])
+    fig2.update_layout(plot_bgcolor="rgba(0,0,0,0)")
+    st.plotly_chart(fig2, use_container_width=True)
+
+    with st.expander("📋 Ver datos completos"):
+        st.dataframe(df_paid, use_container_width=True)
+
+
+# ══════════════════════════════════════════════════════════════════
+# PÁGINA: REPORTES Y COMPARACIONES
+# ══════════════════════════════════════════════════════════════════
+
+elif page == "📊 Reportes":
+    st.title("📊 Reportes y Comparaciones")
+    clients = get_clients()
+
+    tipo = st.radio(
+        "Tipo de comparación",
+        ["📅 Mes actual vs mes anterior", "📆 Mes actual vs mismo mes año pasado", "🗓️ Rango personalizado"],
+        horizontal=True,
+    )
+
+    today = date.today()
+
+    def delta_pct(actual, prev):
+        if prev and prev > 0:
+            return f"{((actual - prev) / prev * 100):+.1f}%"
+        return None
+
+    if tipo == "📅 Mes actual vs mes anterior":
+        st.subheader("Mes actual vs mes anterior")
+        mes_actual_inicio = date(today.year, today.month, 1)
+        mes_actual_fin    = today
+        prev_month        = today.month - 1 if today.month > 1 else 12
+        prev_year         = today.year if today.month > 1 else today.year - 1
+        prev_days         = calendar.monthrange(prev_year, prev_month)[1]
+        mes_prev_inicio   = date(prev_year, prev_month, 1)
+        mes_prev_fin      = date(prev_year, prev_month, prev_days)
+
+        with st.spinner("Cargando datos..."):
+            try:
+                actual = clients["sales"].get_period_summary(mes_actual_inicio, mes_actual_fin)
+                prev   = clients["sales"].get_period_summary(mes_prev_inicio, mes_prev_fin)
+            except Exception as e:
+                st.error(f"Error: {e}")
+                st.stop()
+
+        st.markdown(f"#### {mes_actual_inicio.strftime('%B %Y')} vs {mes_prev_inicio.strftime('%B %Y')}")
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Ingresos brutos", fmt_currency(actual["revenue"]), delta=delta_pct(actual["revenue"], prev["revenue"]))
+        c2.metric("Ingresos netos", fmt_currency(actual["net"]), delta=delta_pct(actual["net"], prev["net"]))
+        c3.metric("Órdenes", f"{actual['orders']:,}", delta=delta_pct(actual["orders"], prev["orders"]))
+        c4.metric("Unidades", f"{actual['units']:,}", delta=delta_pct(actual["units"], prev["units"]))
+
+        if not actual["df"].empty and not prev["df"].empty:
+            df_act = actual["df"].copy()
+            df_prv = prev["df"].copy()
+            df_act["dia"] = df_act["date_created"].dt.day
+            df_prv["dia"] = df_prv["date_created"].dt.day
+            daily_act = df_act.groupby("dia")["total_amount"].sum().reset_index()
+            daily_prv = df_prv.groupby("dia")["total_amount"].sum().reset_index()
+            daily_act["mes"] = mes_actual_inicio.strftime("%B %Y")
+            daily_prv["mes"] = mes_prev_inicio.strftime("%B %Y")
+            df_chart = pd.concat([daily_act, daily_prv])
+            fig = px.line(df_chart, x="dia", y="total_amount", color="mes",
+                          title="Facturación diaria comparada",
+                          labels={"dia": "Día del mes", "total_amount": "Ingresos", "mes": "Mes"},
+                          color_discrete_sequence=["#3483FA", "#FFE600"])
+            st.plotly_chart(fig, use_container_width=True)
+
+        st.markdown("---")
+        col_a, col_b = st.columns(2)
+        with col_a:
+            show_period_detail(actual, mes_actual_inicio.strftime("%B %Y"))
+        with col_b:
+            show_period_detail(prev, mes_prev_inicio.strftime("%B %Y"))
+
+    elif tipo == "📆 Mes actual vs mismo mes año pasado":
+        st.subheader("Mes actual vs mismo mes del año pasado")
+        mes_actual_inicio = date(today.year, today.month, 1)
+        mes_actual_fin    = today
+        ly_inicio         = date(today.year - 1, today.month, 1)
+        ly_dias           = calendar.monthrange(today.year - 1, today.month)[1]
+        ly_fin            = date(today.year - 1, today.month, ly_dias)
+
+        with st.spinner("Cargando datos..."):
+            try:
+                actual = clients["sales"].get_period_summary(mes_actual_inicio, mes_actual_fin)
+                ly     = clients["sales"].get_period_summary(ly_inicio, ly_fin)
+            except Exception as e:
+                st.error(f"Error: {e}")
+                st.stop()
+
+        st.markdown(f"#### {mes_actual_inicio.strftime('%B %Y')} vs {ly_inicio.strftime('%B %Y')}")
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Ingresos brutos", fmt_currency(actual["revenue"]), delta=delta_pct(actual["revenue"], ly["revenue"]))
+        c2.metric("Ingresos netos", fmt_currency(actual["net"]), delta=delta_pct(actual["net"], ly["net"]))
+        c3.metric("Órdenes", f"{actual['orders']:,}", delta=delta_pct(actual["orders"], ly["orders"]))
+        c4.metric("Unidades", f"{actual['units']:,}", delta=delta_pct(actual["units"], ly["units"]))
+
+        if ly["revenue"] == 0:
+            st.warning("No hay datos del año pasado. Cargá el historial desde 🗄️ Historial.")
+
+        st.markdown("---")
+        col_a, col_b = st.columns(2)
+        with col_a:
+            show_period_detail(actual, mes_actual_inicio.strftime("%B %Y"))
+        with col_b:
+            show_period_detail(ly, ly_inicio.strftime("%B %Y"))
+
+    elif tipo == "🗓️ Rango personalizado":
+        st.subheader("Comparar dos períodos personalizados")
+        col_a, col_b = st.columns(2)
+        with col_a:
+            st.markdown("**Período A**")
+            a_desde = st.date_input("Desde", value=date(today.year, today.month, 1), key="a_desde")
+            a_hasta = st.date_input("Hasta", value=today, key="a_hasta")
+        with col_b:
+            st.markdown("**Período B**")
             prev_month  = today.month - 1 if today.month > 1 else 12
             prev_year   = today.year if today.month > 1 else today.year - 1
-            prev_days   = calendar.monthrange(prev_year, prev_month)[1]
-            df_prev     = self.get_orders(days_elapsed + prev_days + 5)
-            df_prev_paid = df_prev[df_prev["status"] == "paid"].copy()
-            df_prev_paid["date"] = df_prev_paid["date_created"].dt.date
-            df_prev_paid = df_prev_paid[
-                (df_prev_paid["date"] >= date(prev_year, prev_month, 1)) &
-                (df_prev_paid["date"] <= date(prev_year, prev_month, prev_days))
-            ]
-            prev_revenue = float(df_prev_paid["total_amount"].sum()) if not df_prev_paid.empty else None
-        except Exception:
-            prev_revenue = None
+            prev_days_n = calendar.monthrange(prev_year, prev_month)[1]
+            b_desde = st.date_input("Desde", value=date(prev_year, prev_month, 1), key="b_desde")
+            b_hasta = st.date_input("Hasta", value=date(prev_year, prev_month, prev_days_n), key="b_hasta")
 
-        proj3_revenue = proj1_revenue
-        proj3_units   = proj1_units
-        proj3_orders  = proj1_orders
-        ly_revenue    = None
+        comparar_btn = st.button("📊 Comparar períodos")
 
-        # Intentar con año anterior desde historial Dropbox
-        try:
-            df_ly = self._load_historical_month(today.year - 1, today.month)
-            if df_ly is not None and not df_ly.empty:
-                df_ly_paid = df_ly[df_ly["status"] == "paid"]
-                ly_revenue = float(df_ly_paid["total_amount"].sum())
-                if ly_revenue > 0:
-                    ly_daily   = ly_revenue / days_in_month
-                    growth_factor = daily_avg_revenue / ly_daily if ly_daily > 0 else 1
-                    proj3_revenue = ly_revenue * growth_factor
-                    proj3_units   = float(df_ly_paid["quantity"].sum()) * growth_factor
-                    proj3_orders  = df_ly_paid["order_id"].nunique() * growth_factor
-        except Exception:
-            pass
+        if comparar_btn:
+            def load_from_dropbox_or_api(date_from, date_to, storage, sales):
+                dfs = []
+                current = date(date_from.year, date_from.month, 1)
+                while current <= date_to:
+                    path = f"data/historical/{current.strftime('%Y-%m')}.parquet"
+                    df_cached = storage.load_dataframe(path)
+                    if df_cached is not None:
+                        dfs.append(df_cached)
+                    if current.month == 12:
+                        current = date(current.year + 1, 1, 1)
+                    else:
+                        current = date(current.year, current.month + 1, 1)
 
-        # ── Factor 4: Estacionalidad histórica (15%) ──────────────
-        # Promedio de este mismo mes en los últimos años disponibles en Dropbox
-        proj4_revenue = proj1_revenue
-        seasonal_revenues = []
-        for yr in range(today.year - 3, today.year):
+                if dfs:
+                    df_all = pd.concat(dfs, ignore_index=True)
+                    df_all["date_created"] = pd.to_datetime(df_all["date_created"])
+                    df_all["date"] = df_all["date_created"].dt.date
+                    df_filtered = df_all[(df_all["date"] >= date_from) & (df_all["date"] <= date_to)]
+                    if not df_filtered.empty:
+                        df_paid = df_filtered[df_filtered["status"] == "paid"].copy()
+                        if "net_amount" not in df_paid.columns:
+                            df_paid["net_amount"] = df_paid["total_amount"] - df_paid.get("sale_fee", 0)
+                        return {
+                            "revenue":    round(float(df_paid["total_amount"].sum()), 2),
+                            "net":        round(float(df_paid["net_amount"].sum()), 2),
+                            "orders":     df_paid["order_id"].nunique(),
+                            "units":      int(df_paid["quantity"].sum()),
+                            "avg_ticket": round(float(df_paid["total_amount"].mean()), 2) if not df_paid.empty else 0,
+                            "df":         df_paid,
+                        }
+                return sales.get_period_summary(date_from, date_to)
+
+            with st.spinner("Cargando datos de ambos períodos..."):
+                try:
+                    periodo_a = load_from_dropbox_or_api(a_desde, a_hasta, clients["storage"], clients["sales"])
+                    periodo_b = load_from_dropbox_or_api(b_desde, b_hasta, clients["storage"], clients["sales"])
+                except Exception as e:
+                    st.error(f"Error: {e}")
+                    st.stop()
+
+            label_a = f"{a_desde} → {a_hasta}"
+            label_b = f"{b_desde} → {b_hasta}"
+
+            st.markdown(f"#### {label_a} vs {label_b}")
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Ingresos brutos", fmt_currency(periodo_a["revenue"]), delta=delta_pct(periodo_a["revenue"], periodo_b["revenue"]))
+            c2.metric("Ingresos netos", fmt_currency(periodo_a["net"]), delta=delta_pct(periodo_a["net"], periodo_b["net"]))
+            c3.metric("Órdenes", f"{periodo_a['orders']:,}", delta=delta_pct(periodo_a["orders"], periodo_b["orders"]))
+            c4.metric("Unidades", f"{periodo_a['units']:,}", delta=delta_pct(periodo_a["units"], periodo_b["units"]))
+
+            if not periodo_a["df"].empty and not periodo_b["df"].empty:
+                df_a = periodo_a["df"].copy()
+                df_b = periodo_b["df"].copy()
+                df_a["dia"] = (pd.to_datetime(df_a["date_created"]) - pd.Timestamp(a_desde)).dt.days + 1
+                df_b["dia"] = (pd.to_datetime(df_b["date_created"]) - pd.Timestamp(b_desde)).dt.days + 1
+                daily_a = df_a.groupby("dia")["total_amount"].sum().reset_index()
+                daily_b = df_b.groupby("dia")["total_amount"].sum().reset_index()
+                daily_a["periodo"] = label_a
+                daily_b["periodo"] = label_b
+                df_chart = pd.concat([daily_a, daily_b])
+                fig = px.line(df_chart, x="dia", y="total_amount", color="periodo",
+                              title="Facturación por día del período",
+                              labels={"dia": "Día del período", "total_amount": "Ingresos", "periodo": "Período"},
+                              color_discrete_sequence=["#FFE600", "#3483FA"])
+                st.plotly_chart(fig, use_container_width=True)
+
+            st.markdown("---")
+            col_det_a, col_det_b = st.columns(2)
+            with col_det_a:
+                show_period_detail(periodo_a, label_a)
+            with col_det_b:
+                show_period_detail(periodo_b, label_b)
+
+
+# ══════════════════════════════════════════════════════════════════
+# PÁGINA: HISTORIAL
+# ══════════════════════════════════════════════════════════════════
+
+elif page == "🗄️ Historial":
+    st.title("🗄️ Carga de Historial")
+    clients = get_clients()
+
+    st.info("Cargá datos históricos mes a mes en Dropbox. Solo necesitás hacerlo una vez por período.")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        fecha_desde = st.date_input("Desde", value=date(2024, 1, 1))
+    with col2:
+        fecha_hasta = st.date_input("Hasta", value=date.today())
+
+    cargar_btn = st.button("📥 Cargar historial en Dropbox")
+
+    if cargar_btn:
+        if fecha_desde >= fecha_hasta:
+            st.error("La fecha de inicio debe ser anterior a la fecha final.")
+            st.stop()
+
+        meses = []
+        current = date(fecha_desde.year, fecha_desde.month, 1)
+        while current <= fecha_hasta:
+            days_in_month = calendar.monthrange(current.year, current.month)[1]
+            mes_fin = date(current.year, current.month, min(days_in_month,
+                          fecha_hasta.day if current.year == fecha_hasta.year and current.month == fecha_hasta.month
+                          else days_in_month))
+            meses.append((current, mes_fin))
+            if current.month == 12:
+                current = date(current.year + 1, 1, 1)
+            else:
+                current = date(current.year, current.month + 1, 1)
+
+        st.info(f"Se cargarán **{len(meses)} meses** desde {fecha_desde} hasta {fecha_hasta}")
+
+        progress_bar = st.progress(0)
+        status_text  = st.empty()
+        results      = []
+
+        for i, (mes_inicio, mes_fin) in enumerate(meses):
+            label = mes_inicio.strftime("%B %Y")
+            status_text.text(f"Cargando {label}...")
             try:
-                df_hist = self._load_historical_month(yr, today.month)
-                if df_hist is not None and not df_hist.empty:
-                    df_hist_paid = df_hist[df_hist["status"] == "paid"]
-                    hist_rev = float(df_hist_paid["total_amount"].sum())
-                    if hist_rev > 0:
-                        seasonal_revenues.append(hist_rev)
-            except Exception:
-                pass
+                df = clients["sales"].get_orders_by_daterange(mes_inicio, mes_fin)
+                if not df.empty:
+                    path = f"data/historical/{mes_inicio.strftime('%Y-%m')}.parquet"
+                    clients["storage"].save_dataframe(df, path)
+                    results.append({"Mes": label, "Órdenes": len(df), "Estado": "OK"})
+                else:
+                    results.append({"Mes": label, "Órdenes": 0, "Estado": "Sin datos"})
+            except Exception as e:
+                results.append({"Mes": label, "Órdenes": 0, "Estado": f"Error: {str(e)[:50]}"})
+            progress_bar.progress((i + 1) / len(meses))
 
-        if seasonal_revenues:
-            avg_seasonal = sum(seasonal_revenues) / len(seasonal_revenues)
-            # Ajustar por crecimiento actual vs histórico
-            if avg_seasonal > 0:
-                growth_rate   = daily_avg_revenue / (avg_seasonal / days_in_month)
-                proj4_revenue = avg_seasonal * growth_rate
-                proj4_units   = proj1_units * (proj4_revenue / proj1_revenue) if proj1_revenue > 0 else proj1_units
-                proj4_orders  = proj1_orders * (proj4_revenue / proj1_revenue) if proj1_revenue > 0 else proj1_orders
+        status_text.text("Carga completada")
+        st.success(f"Historial cargado. {len([r for r in results if r['Estado'] == 'OK'])} meses exitosos.")
+        st.dataframe(pd.DataFrame(results), use_container_width=True, hide_index=True)
+
+
+# ══════════════════════════════════════════════════════════════════
+# PÁGINA: COMPETENCIA
+# ══════════════════════════════════════════════════════════════════
+
+elif page == "🔍 Competencia":
+    st.title("🔍 Análisis de Competencia")
+    clients = get_clients()
+
+    tab_tracker, tab_search = st.tabs(["🎯 La Tentación", "🔍 Buscar otro competidor"])
+
+    with tab_tracker:
+        col_scan, _ = st.columns([1, 3])
+        with col_scan:
+            scan_btn = st.button("🔄 Escanear ahora")
+
+        tracker = CompetitorTracker(seller_id=175850089, seller_nickname="LATENTACIONSRL")
+
+        if scan_btn:
+            with st.spinner("Escaneando publicaciones de La Tentación..."):
+                df_tracker = tracker.save_snapshot()
         else:
-            proj4_units  = proj1_units
-            proj4_orders = proj1_orders
+            with st.spinner("Cargando último snapshot..."):
+                df_tracker = tracker.load_snapshot()
+                if df_tracker is None:
+                    st.info("No hay datos aún. Hacé clic en 'Escanear ahora'.")
+                    df_tracker = pd.DataFrame()
 
-        # ── Factor 5: Velocidad de crecimiento reciente (10%) ─────
-        # Compara promedio últimos 3 días vs días 4-10
-        last3  = df_paid[df_paid["date"] >= (today - timedelta(days=2))]
-        prev7  = df_paid[(df_paid["date"] >= (today - timedelta(days=9))) &
-                         (df_paid["date"] <  (today - timedelta(days=2)))]
+        if not df_tracker.empty:
+            summary = tracker.get_summary()
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Publicaciones encontradas", summary["total_items"])
+            m2.metric("Precio promedio", f"${summary['avg_price']:,.0f}")
+            m3.metric("Precio mínimo", f"${summary['min_price']:,.0f}")
+            m4.metric("Precio máximo", f"${summary['max_price']:,.0f}")
+            st.caption(f"Último scan: {summary.get('last_snapshot', '—')}")
 
-        days3  = max(len(last3["date"].unique()), 1)
-        days_p = max(len(prev7["date"].unique()), 1)
+            cats = summary.get("categories_found", {})
+            if cats:
+                st.markdown("**Items por categoría:**")
+                cols_cat = st.columns(len(cats))
+                for i, (cat, count) in enumerate(cats.items()):
+                    cols_cat[i].metric(cat.title(), count)
 
-        avg3   = float(last3["total_amount"].sum()) / days3 if not last3.empty else daily_avg_revenue
-        avg_p  = float(prev7["total_amount"].sum()) / days_p if not prev7.empty else daily_avg_revenue
+            t1, t2, t3 = st.tabs(["📋 Todas las publicaciones", "🆕 Nuevas publicaciones", "💰 Cambios de precio"])
+            with t1:
+                cols_show = ["title", "price", "available_qty", "sold_qty", "category", "listing_type", "permalink"]
+                st.dataframe(df_tracker[[c for c in cols_show if c in df_tracker.columns]], use_container_width=True)
+            with t2:
+                df_new = tracker.detect_new_items()
+                if df_new.empty:
+                    st.info("No hay publicaciones nuevas desde el último scan.")
+                else:
+                    st.success(f"🆕 {len(df_new)} publicaciones nuevas detectadas")
+                    st.dataframe(df_new[["title", "price", "category", "permalink"]], use_container_width=True)
+            with t3:
+                df_price = tracker.detect_price_changes()
+                if df_price.empty:
+                    st.info("No hay cambios de precio desde el último scan.")
+                else:
+                    st.warning(f"💰 {len(df_price)} cambios de precio detectados")
+                    st.dataframe(df_price[["title", "prev_price", "price", "price_diff", "price_diff_pct", "direction"]], use_container_width=True)
 
-        # Factor de aceleración (limitado entre 0.5x y 2x para evitar extremos)
-        acceleration = max(0.5, min(2.0, avg3 / avg_p if avg_p > 0 else 1.0))
-        proj5_revenue = revenue_so_far + (daily_avg_revenue * acceleration * days_remaining)
-        proj5_units   = units_so_far   + (daily_avg_units   * acceleration * days_remaining)
-        proj5_orders  = orders_so_far  + (daily_avg_orders  * acceleration * days_remaining)
+    with tab_search:
+        st.subheader("Buscar competidor")
+        col_input, col_btn = st.columns([3, 1])
+        with col_input:
+            seller_input = st.text_input("Nickname o User ID del competidor", placeholder="Ej: nombre_vendedor o 123456789")
+        with col_btn:
+            st.write("")
+            search_btn = st.button("🔍 Analizar")
 
-        # ── Factor 6: Forma intra-mes (peso por día de la semana) ─
-        # En lugar de proyectar los días restantes con un promedio plano
-        # (lo que hacen los factores 1, 2 y 5), pondera cada día que falta
-        # según cuánto rinde ese día de la semana en el histórico reciente
-        # (~12 semanas). Corrige el sesgo de que a los días restantes les
-        # toquen más (o menos) fines de semana / días fuertes que a los
-        # días ya transcurridos del mes.
-        wd_mult = {wd: 1.0 for wd in range(7)}  # 0=lunes .. 6=domingo
-        try:
-            df_hist90 = self.get_orders(90)
-            df_h = df_hist90[df_hist90["status"] == "paid"].copy()
-            df_h["date"] = df_h["date_created"].dt.date
+        if search_btn and seller_input:
+            with st.spinner(f"Analizando {seller_input}..."):
+                if not seller_input.isdigit():
+                    user = clients["competition"].search_seller_by_nickname(seller_input)
+                    if not user:
+                        st.error(f"No se encontró el vendedor '{seller_input}'")
+                        st.stop()
+                    seller_id = str(user["id"])
+                    st.success(f"Vendedor encontrado: **{user.get('nickname')}** (ID: {seller_id})")
+                else:
+                    seller_id = seller_input
 
-            daily = df_h.groupby("date").agg(
-                rev=("total_amount", "sum"),
-                un=("quantity", "sum"),
-                ords=("order_id", "nunique"),
-            ).reset_index()
-            daily["wd"] = daily["date"].apply(lambda d: d.weekday())
+                profile = clients["competition"].get_seller_profile(seller_id)
+                col1, col2, col3 = st.columns(3)
+                col1.metric("Nivel", profile.get("level_id", "—"))
+                col2.metric("Transacciones", f"{profile.get('transactions_total', 0):,}")
+                col3.metric("Power Seller", profile.get("power_seller_status", "—"))
 
-            overall_daily_rev = float(daily["rev"].mean()) if not daily.empty else daily_avg_revenue
-            if overall_daily_rev > 0:
-                for wd in range(7):
-                    sub = daily[daily["wd"] == wd]
-                    if not sub.empty:
-                        wd_mult[wd] = float(sub["rev"].mean()) / overall_daily_rev
-        except Exception:
-            pass
+                st.subheader("Publicaciones activas")
+                df_items = clients["competition"].sync_seller(seller_id)
+                if not df_items.empty:
+                    col_a, col_b, col_c = st.columns(3)
+                    col_a.metric("Total publicaciones", len(df_items))
+                    col_b.metric("Precio promedio", fmt_currency(df_items["price"].mean()))
+                    col_c.metric("Unidades vendidas totales", f"{df_items['sold_qty'].sum():,}")
+                    fig = px.histogram(df_items, x="price", nbins=20, title="Distribución de precios", color_discrete_sequence=["#3483FA"])
+                    st.plotly_chart(fig, use_container_width=True)
+                    cols_show = ["title", "price", "sold_qty", "available_qty", "listing_type", "permalink"]
+                    st.dataframe(df_items[[c for c in cols_show if c in df_items.columns]], use_container_width=True)
 
-        # Suma de pesos de los días que faltan del mes.
-        # Si el patrón fuera plano (todos los multiplicadores ≈ 1), esta
-        # suma ≈ days_remaining y el factor coincide con el factor 1.
-        weight_remaining = 0.0
-        for day_num in range(days_elapsed + 1, days_in_month + 1):
-            wd = date(today.year, today.month, day_num).weekday()
-            weight_remaining += wd_mult.get(wd, 1.0)
 
-        proj6_revenue = revenue_so_far + (daily_avg_revenue * weight_remaining)
-        proj6_units   = units_so_far   + (daily_avg_units   * weight_remaining)
-        proj6_orders  = orders_so_far  + (daily_avg_orders  * weight_remaining)
+# ══════════════════════════════════════════════════════════════════
+# PÁGINA: TENDENCIAS
+# ══════════════════════════════════════════════════════════════════
 
-        # ── Proyección ponderada (6 factores) ─────────────────────
-        # Se le baja peso al promedio plano (factor 1) y se le da al
-        # factor 6 (forma intra-mes). Al factor 5 (velocidad) se le bajó
-        # el peso porque el backtest mostró que es el menos preciso.
-        w1, w2, w3, w4, w5, w6 = 0.15, 0.25, 0.20, 0.15, 0.05, 0.20
-        forecast_revenue = (proj1_revenue * w1) + (proj2_revenue * w2) + (proj3_revenue * w3) + (proj4_revenue * w4) + (proj5_revenue * w5) + (proj6_revenue * w6)
-        forecast_units   = (proj1_units   * w1) + (proj2_units   * w2) + (proj3_units   * w3) + (proj4_units   * w4) + (proj5_units   * w5) + (proj6_units   * w6)
-        forecast_orders  = (proj1_orders  * w1) + (proj2_orders  * w2) + (proj3_orders  * w3) + (proj4_orders  * w4) + (proj5_orders  * w5) + (proj6_orders  * w6)
+elif page == "📈 Tendencias":
+    st.title("📈 Tendencias de Mercado")
+    clients = get_clients()
 
-        ensemble_revenue = forecast_revenue  # guardar la versión pre-blend
+    @st.cache_data(ttl=3600)
+    def load_categories():
+        return clients["categories"].get_categories_tree()
 
-        # ── Blend por confianza (shrinkage hacia el nivel base) ───
-        # A principio de mes el ensemble extrapola pocos días y es
-        # inestable (el backtest lo confirma: ~24% de error a día 5).
-        # Lo mezclamos con el nivel base reciente (promedio ponderado de
-        # los últimos 3 meses completos, vía API), con peso α que crece
-        # con los días transcurridos: temprano confía en el base, tarde
-        # en la extrapolación. α = días_transcurridos / días_del_mes.
-        baseline_revenue = baseline_units = baseline_orders = None
-        try:
-            b_rev, b_un, b_or = [], [], []
-            by, bm = today.year, today.month
-            for _ in range(3):              # 3 meses previos (nuevo -> viejo)
-                bm -= 1
-                if bm == 0:
-                    bm, by = 12, by - 1
-                bdim = calendar.monthrange(by, bm)[1]
-                dfb = self.get_orders_by_daterange(date(by, bm, 1), date(by, bm, bdim))
-                if not dfb.empty:
-                    dfb = dfb[dfb["status"] == "paid"]
-                    tot = float(dfb["total_amount"].sum())
-                    if tot > 0:
-                        b_rev.append(tot)
-                        b_un.append(int(dfb["quantity"].sum()))
-                        b_or.append(dfb["order_id"].nunique())
-            if b_rev:
-                # pesos por recencia: el mes más reciente pesa más (3,2,1)
-                ws = list(range(len(b_rev), 0, -1))   # ej. [3,2,1]
-                sw = float(sum(ws))
-                baseline_revenue = sum(w * v for w, v in zip(ws, b_rev)) / sw
-                baseline_units   = sum(w * v for w, v in zip(ws, b_un))  / sw
-                baseline_orders  = sum(w * v for w, v in zip(ws, b_or))  / sw
-        except Exception:
-            pass
+    df_cats = load_categories()
+    if df_cats.empty:
+        st.error("No se pudieron cargar las categorías.")
+        st.stop()
 
-        blend_alpha = days_elapsed / days_in_month
-        if baseline_revenue and baseline_revenue > 0:
-            forecast_revenue = blend_alpha * forecast_revenue + (1 - blend_alpha) * baseline_revenue
-            forecast_units   = blend_alpha * forecast_units   + (1 - blend_alpha) * baseline_units
-            forecast_orders  = blend_alpha * forecast_orders  + (1 - blend_alpha) * baseline_orders
+    cat_options = {row["name"]: row["category_id"] for _, row in df_cats.iterrows()}
+    selected_cat_name = st.selectbox("Seleccioná una categoría", list(cat_options.keys()))
+    selected_cat_id   = cat_options[selected_cat_name]
 
-        # ── Comparaciones ─────────────────────────────────────────
-        vs_prev_pct = None
-        if prev_revenue and prev_revenue > 0:
-            vs_prev_pct = round((forecast_revenue - prev_revenue) / prev_revenue * 100, 1)
+    col_btn, _ = st.columns([1, 4])
+    with col_btn:
+        analyze_btn = st.button("📊 Analizar categoría")
 
-        vs_ly_pct = None
-        if ly_revenue and ly_revenue > 0:
-            vs_ly_pct = round((forecast_revenue - ly_revenue) / ly_revenue * 100, 1)
+    if analyze_btn:
+        with st.spinner(f"Analizando {selected_cat_name}..."):
+            tab1, tab2, tab3 = st.tabs(["🏆 Top Items", "🔍 Tendencias", "💡 Oportunidades"])
+            with tab1:
+                df_top = clients["categories"].get_top_items_in_category(selected_cat_id)
+                if not df_top.empty:
+                    st.dataframe(df_top[["title", "price", "sold_qty", "seller_nickname", "permalink"]], use_container_width=True)
+                else:
+                    st.info("Sin datos.")
+            with tab2:
+                df_trends = clients["categories"].get_search_trends(selected_cat_id)
+                if not df_trends.empty:
+                    for _, row in df_trends.iterrows():
+                        st.write(f"**#{row['rank']}** {row['keyword']}")
+                else:
+                    st.info("Sin datos de tendencias para esta categoría.")
+            with tab3:
+                df_opp = clients["categories"].find_opportunities(selected_cat_id)
+                if not df_opp.empty:
+                    st.success(f"Se encontraron {len(df_opp)} oportunidades")
+                    st.dataframe(df_opp[["title", "sold_qty", "seller_count", "opportunity_score", "price"]], use_container_width=True)
+                else:
+                    st.info("Sin oportunidades claras en esta categoría.")
 
-        return {
-            "month":               today.strftime("%B %Y"),
-            "days_elapsed":        days_elapsed,
-            "days_remaining":      days_remaining,
-            "days_in_month":       days_in_month,
-            "revenue_so_far":      round(revenue_so_far, 2),
-            "units_so_far":        units_so_far,
-            "orders_so_far":       orders_so_far,
-            "net_so_far":          round(net_so_far, 2),
-            "forecast_revenue":    round(forecast_revenue, 2),
-            "forecast_units":      round(forecast_units),
-            "forecast_orders":     round(forecast_orders),
-            "forecast_net":        round(forecast_revenue * (net_so_far / revenue_so_far) if revenue_so_far > 0 else 0, 2),
-            "vs_prev_month_pct":   vs_prev_pct,
-            "vs_last_year_pct":    vs_ly_pct,
-            "prev_month_revenue":  round(prev_revenue, 2) if prev_revenue else None,
-            "last_year_revenue":   round(ly_revenue, 2) if ly_revenue else None,
-            "proj_daily_avg":      round(proj1_revenue, 2),
-            "proj_trend_7d":       round(proj2_revenue, 2),
-            "proj_last_year":      round(proj3_revenue, 2),
-            "proj_seasonal":       round(proj4_revenue, 2),
-            "proj_acceleration":   round(proj5_revenue, 2),
-            "proj_calendar":       round(proj6_revenue, 2),
-            "acceleration_factor": round(acceleration, 2),
-            "weekday_weights":     {int(k): round(v, 2) for k, v in wd_mult.items()},
-            "calendar_shape_pct":  round((weight_remaining / days_remaining - 1) * 100, 1) if days_remaining > 0 else 0.0,
-            "seasonal_years":      len(seasonal_revenues),
-            "ensemble_revenue":    round(ensemble_revenue, 2),
-            "baseline_revenue":    round(baseline_revenue, 2) if baseline_revenue else None,
-            "blend_alpha":         round(blend_alpha, 2),
-            "daily_avg_revenue":   round(daily_avg_revenue, 2),
-            "daily_trend_revenue": round(daily_trend_revenue, 2),
-        }
 
-    def backtest_forecast(self, months_back: int = 6, cutoffs=(5, 10, 15, 20)) -> dict:
-        """
-        Backtest del pronóstico: re-corre la proyección como si fuera el
-        día X de meses ya cerrados y mide el error (MAPE) contra el total
-        real de cada mes.
+# ══════════════════════════════════════════════════════════════════
+# PÁGINA: KEYWORDS
+# ══════════════════════════════════════════════════════════════════
 
-        Solo backtestea los factores reproducibles con la data de la API:
-          - proj1 (promedio diario), proj2 (tendencia 7d),
-            proj5 (velocidad), proj6 (forma intra-mes).
-        Los factores 3 (año anterior) y 4 (estacionalidad) dependen de
-        historial en Dropbox que no existe para meses pasados; en el
-        ensemble actual colapsan al factor 1 (igual que en producción),
-        por eso el peso efectivo de proj1 es w1+w3+w4 = 0.50.
+elif page == "🔑 Keywords":
+    st.title("🔑 Investigación de Keywords")
+    clients = get_clients()
 
-        Optimizado: baja el peso por día de la semana una sola vez y
-        cada mes a testear una sola vez (sin solapamientos), para
-        minimizar las llamadas a la API.
+    st.subheader("Expandir keywords")
+    seed = st.text_input("Keyword semilla", placeholder="Ej: zapatillas running")
 
-        Devuelve: MAPE por factor, MAPE del ensemble con los pesos
-        actuales, y los pesos óptimos que minimizan el MAPE sobre estos
-        datos (búsqueda en grilla sobre el símplex).
-        """
-        import numpy as np
+    col1, col2 = st.columns(2)
+    with col1:
+        depth = st.selectbox("Profundidad de expansión", [1, 2], index=1)
+    with col2:
+        expand_btn = st.button("🔍 Expandir")
 
-        today = _today_uy()
+    if expand_btn and seed:
+        with st.spinner(f"Expandiendo '{seed}'..."):
+            df_kw = clients["keywords"].expand_keywords(seed, depth=depth)
+        if not df_kw.empty:
+            fig = px.bar(df_kw.head(20), x="keyword", y="total_results",
+                         title="Resultados por keyword",
+                         color_discrete_sequence=["#3483FA"])
+            fig.update_layout(xaxis_tickangle=-45)
+            st.plotly_chart(fig, use_container_width=True)
+            st.dataframe(df_kw, use_container_width=True)
 
-        # Meses completos a testear (excluye el mes actual)
-        months = []
-        y, m = today.year, today.month
-        for _ in range(months_back):
-            m -= 1
-            if m == 0:
-                m, y = 12, y - 1
-            months.append((y, m))
+    st.markdown("---")
+    st.subheader("Evaluar título")
+    title_input  = st.text_input("Título a evaluar", placeholder="Zapatillas Running Hombre Nike Air Max Talle 42")
+    cat_id_input = st.text_input("Category ID (opcional)", placeholder="MLU5726")
 
-        # ── Peso por día de la semana: se calcula UNA sola vez ────
-        # (en vez de re-bajarlo por cada mes). El patrón semanal es
-        # estable, así que usar una ventana reciente única es buena
-        # aproximación y baja muchísimo las llamadas a la API.
-        wd_mult_global = {wd: 1.0 for wd in range(7)}
-        try:
-            df_wd = self.get_orders(120)
-            df_wd = df_wd[df_wd["status"] == "paid"].copy()
-            df_wd["date"] = df_wd["date_created"].dt.date
-            daily_wd = df_wd.groupby("date")["total_amount"].sum().reset_index()
-            daily_wd["wd"] = daily_wd["date"].apply(lambda d: d.weekday())
-            od = float(daily_wd["total_amount"].mean()) if not daily_wd.empty else 0.0
-            if od > 0:
-                for wd in range(7):
-                    sub = daily_wd[daily_wd["wd"] == wd]
-                    if not sub.empty:
-                        wd_mult_global[wd] = float(sub["total_amount"].mean()) / od
-        except Exception:
-            pass
-
-        samples = []          # [p1, p2, p5, p6, actual]
-        sample_cuts = []      # día de corte K de cada muestra
-        sample_alpha = []     # α = K/dim de cada muestra
-        sample_base = []      # nivel base del mes (o NaN si no hay)
-        tested_months = set()
-
-        # Bajar los meses a testear + los 3 previos al más viejo (para el
-        # nivel base del blend). Cada mes se baja UNA sola vez.
-        all_months = list(months)
-        ey, em = months[-1]              # mes más viejo a testear
-        for _ in range(3):
-            em -= 1
-            if em == 0:
-                em, ey = 12, ey - 1
-            all_months.append((ey, em))
-
-        month_df, month_total = {}, {}
-        for (yy, mm) in all_months:
-            dim = calendar.monthrange(yy, mm)[1]
-            try:
-                dfm = self.get_orders_by_daterange(date(yy, mm, 1), date(yy, mm, dim))
-            except Exception:
-                continue
-            if dfm.empty or "date" not in dfm.columns:
-                continue
-            dfm = dfm[dfm["status"] == "paid"].copy()
-            month_df[(yy, mm)]    = dfm
-            month_total[(yy, mm)] = float(dfm["total_amount"].sum())
-
-        def _baseline_for(yy, mm):
-            """Promedio de los 3 meses previos, ponderado por recencia."""
-            vals = []
-            py, pm = yy, mm
-            for _ in range(3):
-                pm -= 1
-                if pm == 0:
-                    pm, py = 12, py - 1
-                t = month_total.get((py, pm))
-                if t and t > 0:
-                    vals.append(t)
-            if not vals:
-                return None
-            ws = list(range(len(vals), 0, -1))   # el más reciente pesa más
-            return sum(w * v for w, v in zip(ws, vals)) / float(sum(ws))
-
-        for (yy, mm) in months:
-            dim    = calendar.monthrange(yy, mm)[1]
-            df_m   = month_df.get((yy, mm))
-            actual = month_total.get((yy, mm), 0.0)
-            if df_m is None or df_m.empty or actual <= 0:
-                continue
-            base_m = _baseline_for(yy, mm)
-
-            for K in cutoffs:
-                if K >= dim:
-                    continue
-                cutoff = date(yy, mm, K)
-                df_el  = df_m[df_m["date"] <= cutoff]
-                if df_el.empty:
-                    continue
-                rev_sf = float(df_el["total_amount"].sum())
-                if rev_sf <= 0:
-                    continue
-
-                days_rem  = dim - K
-                daily_avg = rev_sf / K
-
-                # Factor 1: promedio diario plano
-                p1 = rev_sf + daily_avg * days_rem
-
-                # Factor 2: tendencia 7 días previos al corte
-                last7 = df_el[df_el["date"] >= (cutoff - timedelta(days=6))]
-                d7    = max(len(last7["date"].unique()), 1)
-                trend = float(last7["total_amount"].sum()) / d7
-                p2    = rev_sf + trend * days_rem
-
-                # Factor 5: aceleración (últ. 3d vs días 4-10 dentro del mes)
-                l3 = df_el[df_el["date"] >= (cutoff - timedelta(days=2))]
-                pp = df_el[(df_el["date"] >= (cutoff - timedelta(days=9))) &
-                           (df_el["date"] <  (cutoff - timedelta(days=2)))]
-                d3 = max(len(l3["date"].unique()), 1)
-                dp = max(len(pp["date"].unique()), 1)
-                a3 = float(l3["total_amount"].sum()) / d3 if not l3.empty else daily_avg
-                ap = float(pp["total_amount"].sum()) / dp if not pp.empty else daily_avg
-                accel = max(0.5, min(2.0, a3 / ap if ap > 0 else 1.0))
-                p5 = rev_sf + daily_avg * accel * days_rem
-
-                # Factor 6: forma intra-mes (usa el peso por día calculado una vez)
-                wr = 0.0
-                for dn in range(K + 1, dim + 1):
-                    wr += wd_mult_global.get(date(yy, mm, dn).weekday(), 1.0)
-                p6 = rev_sf + daily_avg * wr
-
-                samples.append([p1, p2, p5, p6, actual])
-                sample_cuts.append(K)
-                sample_alpha.append(K / dim)
-                sample_base.append(base_m if base_m else np.nan)
-                tested_months.add((yy, mm))
-
-        if not samples:
-            return {"samples": 0, "months_tested": 0, "cutoffs": list(cutoffs),
-                    "error": "No hay meses cerrados con datos suficientes en la ventana de la API"}
-
-        arr    = np.array(samples, dtype=float)   # (n, 5)
-        P      = arr[:, :4]                        # p1, p2, p5, p6
-        y_true = arr[:, 4]
-
-        def mape(pred):
-            return float(np.mean(np.abs(pred - y_true) / y_true) * 100)
-
-        factor_mape = {
-            "proj1": mape(P[:, 0]),
-            "proj2": mape(P[:, 1]),
-            "proj5": mape(P[:, 2]),
-            "proj6": mape(P[:, 3]),
-        }
-
-        # Ensemble con pesos ACTUALES (3 y 4 colapsan a p1):
-        # efectivo -> p1=w1+w3+w4=0.50, p2=0.25, p5=0.05, p6=0.20
-        w_cur   = np.array([0.50, 0.25, 0.05, 0.20])
-        ens_cur = mape(P @ w_cur)
-
-        # Pesos óptimos: grilla sobre el símplex (paso 0.05) que minimiza MAPE
-        step = 0.05
-        n    = int(round(1 / step))
-        best_w, best_mape = w_cur, ens_cur
-        for a in range(n + 1):
-            for b in range(n + 1 - a):
-                for c in range(n + 1 - a - b):
-                    d = n - a - b - c
-                    w = np.array([a, b, c, d], dtype=float) * step
-                    mp = mape(P @ w)
-                    if mp < best_mape:
-                        best_mape, best_w = mp, w
-
-        # MAPE del ensemble actual separado por día de corte.
-        # Dice a partir de qué día del mes el pronóstico ya es confiable.
-        cuts_arr = np.array(sample_cuts)
-        ens_pred = P @ w_cur
-        mape_by_cutoff = {}
-        for K in sorted(set(sample_cuts)):
-            mask = cuts_arr == K
-            if mask.any():
-                err = np.abs(ens_pred[mask] - y_true[mask]) / y_true[mask]
-                mape_by_cutoff[int(K)] = round(float(np.mean(err) * 100), 1)
-
-        # Mismo cálculo pero CON el blend por confianza:
-        #   pred = α·ensemble + (1-α)·nivel_base   (α = K/dim)
-        base_arr  = np.array(sample_base, dtype=float)
-        alpha_arr = np.array(sample_alpha, dtype=float)
-        have_base = ~np.isnan(base_arr)
-        blend_pred = ens_pred.copy()
-        blend_pred[have_base] = (alpha_arr[have_base] * ens_pred[have_base] +
-                                 (1.0 - alpha_arr[have_base]) * base_arr[have_base])
-        ens_blend = float(np.mean(np.abs(blend_pred - y_true) / y_true) * 100)
-        mape_by_cutoff_blend = {}
-        for K in sorted(set(sample_cuts)):
-            mask = cuts_arr == K
-            if mask.any():
-                err = np.abs(blend_pred[mask] - y_true[mask]) / y_true[mask]
-                mape_by_cutoff_blend[int(K)] = round(float(np.mean(err) * 100), 1)
-
-        return {
-            "samples":                 len(samples),
-            "months_tested":           len(tested_months),
-            "cutoffs":                 list(cutoffs),
-            "factor_mape":             {k: round(v, 1) for k, v in factor_mape.items()},
-            "ensemble_mape_current":   round(ens_cur, 1),
-            "ensemble_mape_optimized": round(best_mape, 1),
-            "ensemble_mape_blend":     round(ens_blend, 1),
-            "mape_by_cutoff":          mape_by_cutoff,
-            "mape_by_cutoff_blend":    mape_by_cutoff_blend,
-            "current_weights_eff":     {"proj1": 0.50, "proj2": 0.25, "proj5": 0.05, "proj6": 0.20},
-            "optimized_weights":       {
-                "proj1": round(float(best_w[0]), 2),
-                "proj2": round(float(best_w[1]), 2),
-                "proj5": round(float(best_w[2]), 2),
-                "proj6": round(float(best_w[3]), 2),
-            },
-        }
+    if st.button("⭐ Evaluar") and title_input and cat_id_input:
+        with st.spinner("Evaluando..."):
+            result = clients["keywords"].score_title(title_input, cat_id_input)
+        score = result.get("score", 0)
+        color = "🟢" if score >= 70 else "🟡" if score >= 40 else "🔴"
+        st.metric(f"Score del título {color}", f"{score}/100")
+        if result.get("matched_keywords"):
+            st.success("✅ Keywords encontradas: " + ", ".join(result["matched_keywords"]))
+        if result.get("suggested_keywords"):
+            st.warning("💡 Sugerencias para agregar: " + ", ".join(result["suggested_keywords"]))
+        if result.get("too_long"):
+            st.warning(f"⚠️ Título muy largo ({result['title_length']} chars). Recomendado: máx 60.")
