@@ -438,11 +438,14 @@ class MySalesExtractor:
             except Exception:
                 pass
 
-        blend_alpha = days_elapsed / days_in_month
-        if baseline_revenue and baseline_revenue > 0:
-            forecast_revenue = blend_alpha * forecast_revenue + (1 - blend_alpha) * baseline_revenue
-            forecast_units   = blend_alpha * forecast_units   + (1 - blend_alpha) * baseline_units
-            forecast_orders  = blend_alpha * forecast_orders  + (1 - blend_alpha) * baseline_orders
+        # Blend DESACTIVADO. El backtest mostró que mezclar hacia el nivel
+        # base (promedio de 3 meses) empeoraba el pronóstico en TODOS los
+        # cortes (global 15.7% -> 20.1%): el negocio viene en crecimiento y
+        # el promedio histórico queda corto, así que tirar hacia él baja la
+        # proyección de más. Se usa el ensemble puro de 6 factores, que el
+        # propio backtest muestra como el más certero.
+        blend_alpha = 1.0
+        baseline_revenue = baseline_units = baseline_orders = None
 
         # ── Comparaciones ─────────────────────────────────────────
         vs_prev_pct = None
