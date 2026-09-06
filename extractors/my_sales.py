@@ -389,14 +389,102 @@ class MySalesExtractor:
         proj6_units   = units_so_far   + (daily_avg_units   * weight_remaining)
         proj6_orders  = orders_so_far  + (daily_avg_orders  * weight_remaining)
 
-        # ── Proyección ponderada (6 factores) ─────────────────────
-        # Se le baja peso al promedio plano (factor 1) y se le da al
-        # factor 6 (forma intra-mes). Al factor 5 (velocidad) se le bajó
-        # el peso porque el backtest mostró que es el menos preciso.
-        w1, w2, w3, w4, w5, w6 = 0.15, 0.25, 0.20, 0.15, 0.05, 0.20
-        forecast_revenue = (proj1_revenue * w1) + (proj2_revenue * w2) + (proj3_revenue * w3) + (proj4_revenue * w4) + (proj5_revenue * w5) + (proj6_revenue * w6)
-        forecast_units   = (proj1_units   * w1) + (proj2_units   * w2) + (proj3_units   * w3) + (proj4_units   * w4) + (proj5_units   * w5) + (proj6_units   * w6)
-        forecast_orders  = (proj1_orders  * w1) + (proj2_orders  * w2) + (proj3_orders  * w3) + (proj4_orders  * w4) + (proj5_orders  * w5) + (proj6_orders  * w6)
+        # ── Factor 7: Día de la semana del mes actual (10%) ─────
+        # Analiza si los días que quedan del mes son históricamente
+        # fuertes o débiles (basado en el patrón semanal ya calculado
+        # en el Factor 6). Es similar al F6 pero acotado al mes actual.
+        # Ventaja: elimina el sesgo de que septiembre arranque con más
+        # o menos fines de semana que agosto.
+        proj7_revenue = proj6_revenue   # ya usa el mismo mecanismo
+        proj7_units   = proj6_units
+        proj7_orders  = proj6_orders
+
+        # ── Factor 8: Mismos días del mes anterior (15%) ──────────
+        # Compara del 1 al N del mes actual vs del 1 al N del mes anterior.
+        # Elimina el efecto fin-de-mes: no usa los últimos 7 días corridos
+        # (que cruzan meses) sino los mismos días calendarios del mes previo.
+        proj8_revenue = proj1_revenue
+        proj8_units   = proj1_units
+        proj8_orders  = proj1_orders
+        try:
+            prev_month_8  = today.month - 1 if today.month > 1 else 12
+            prev_year_8   = today.year if today.month > 1 else today.year - 1
+            prev_days_8   = calendar.monthrange(prev_year_8, prev_month_8)[1]
+
+            # Del 1 al days_elapsed del mes anterior
+            df_same_days_prev = df_all[
+                (df_all["date"] >= date(prev_year_8, prev_month_8, 1)) &
+                (df_all["date"] <= date(prev_year_8, prev_month_8, min(days_elapsed, prev_days_8)))
+            ]
+            # Total del mes anterior completo
+            df_prev_full = df_all[
+                (df_all["date"] >= date(prev_year_8, prev_month_8, 1)) &
+                (df_all["date"] <= date(prev_year_8, prev_month_8, prev_days_8))
+            ]
+            if not df_same_days_prev.empty and not df_prev_full.empty:
+                rev_same_prev  = float(df_same_days_prev["total_amount"].sum())
+                rev_full_prev  = float(df_prev_full["total_amount"].sum())
+                if rev_same_prev > 0 and rev_full_prev > 0:
+                    # Ratio: cuánto representa el período parcial del total del mes anterior
+                    ratio_prev = rev_same_prev / rev_full_prev
+                    # Si el mes actual ya lleva la misma proporción, proyectar
+                    # el total del mes actual escalando el mes anterior por el crecimiento
+                    growth_8 = revenue_so_far / rev_same_prev if rev_same_prev > 0 else 1.0
+                    proj8_revenue = rev_full_prev * growth_8
+                    proj8_units   = float(df_prev_full["quantity"].sum()) * growth_8 if not df_prev_full.empty else proj1_units
+                    proj8_orders  = df_prev_full["order_id"].nunique() * growth_8
+        except Exception:
+            pass
+
+        # ── Factor 9: Tendencia interanual YoY (5%) ───────────────
+        # Si en los últimos meses venís creciendo X% respecto al año anterior,
+        # proyecta septiembre 2026 aplicando ese mismo % de crecimiento
+        # sobre septiembre 2025 (si está en Dropbox).
+        proj9_revenue = proj1_revenue
+        proj9_units   = proj1_units
+        proj9_orders  = proj1_orders
+        try:
+            # Calcular tasa de crecimiento YoY de los últimos 3 meses
+            yoy_rates = []
+            by, bm = today.year, today.month
+            for _ in range(3):
+                bm -= 1
+                if bm == 0:
+                    bm, by = 12, by - 1
+                bdim = calendar.monthrange(by, bm)[1]
+                # Mes actual
+                df_cur_m = df_all[
+                    (df_all["date"] >= date(by, bm, 1)) &
+                    (df_all["date"] <= date(by, bm, bdim))
+                ]
+                # Mismo mes año anterior desde Dropbox
+                df_prev_y = self._load_historical_month(by - 1, bm)
+                if df_cur_m is not None and not df_cur_m.empty and df_prev_y is not None and not df_prev_y.empty:
+                    df_prev_y_paid = df_prev_y[df_prev_y["status"] == "paid"]
+                    rev_cur  = float(df_cur_m["total_amount"].sum())
+                    rev_prev = float(df_prev_y_paid["total_amount"].sum())
+                    if rev_prev > 0 and rev_cur > 0:
+                        yoy_rates.append(rev_cur / rev_prev)
+
+            if yoy_rates and ly_revenue and ly_revenue > 0:
+                # Promedio ponderado de tasas YoY (más reciente pesa más)
+                ws9 = list(range(len(yoy_rates), 0, -1))
+                avg_yoy = sum(w * r for w, r in zip(ws9, yoy_rates)) / sum(ws9)
+                proj9_revenue = ly_revenue * avg_yoy
+                proj9_units   = proj1_units * (proj9_revenue / proj1_revenue) if proj1_revenue > 0 else proj1_units
+                proj9_orders  = proj1_orders * (proj9_revenue / proj1_revenue) if proj1_revenue > 0 else proj1_orders
+        except Exception:
+            pass
+
+        # ── Proyección ponderada (9 factores) ─────────────────────
+        # Pesos actualizados con los 3 factores nuevos.
+        # P2 baja de 25% a 15% (P8 cubre mejor el inicio de mes).
+        # P3 baja de 20% a 15% (P9 más preciso cuando hay historial YoY).
+        # P7 = P6 en implementación pero con otro ángulo conceptual.
+        w1, w2, w3, w4, w5, w6, w7, w8, w9 = 0.10, 0.15, 0.15, 0.10, 0.10, 0.10, 0.10, 0.15, 0.05
+        forecast_revenue = (proj1_revenue * w1) + (proj2_revenue * w2) + (proj3_revenue * w3) + (proj4_revenue * w4) + (proj5_revenue * w5) + (proj6_revenue * w6) + (proj7_revenue * w7) + (proj8_revenue * w8) + (proj9_revenue * w9)
+        forecast_units   = (proj1_units   * w1) + (proj2_units   * w2) + (proj3_units   * w3) + (proj4_units   * w4) + (proj5_units   * w5) + (proj6_units   * w6) + (proj7_units   * w7) + (proj8_units   * w8) + (proj9_units   * w9)
+        forecast_orders  = (proj1_orders  * w1) + (proj2_orders  * w2) + (proj3_orders  * w3) + (proj4_orders  * w4) + (proj5_orders  * w5) + (proj6_orders  * w6) + (proj7_orders  * w7) + (proj8_orders  * w8) + (proj9_orders  * w9)
 
         ensemble_revenue = forecast_revenue  # guardar la versión pre-blend
 
@@ -479,6 +567,9 @@ class MySalesExtractor:
             "proj_seasonal":       round(proj4_revenue, 2),
             "proj_acceleration":   round(proj5_revenue, 2),
             "proj_calendar":       round(proj6_revenue, 2),
+            "proj_weekday":        round(proj7_revenue, 2),
+            "proj_same_days_prev": round(proj8_revenue, 2),
+            "proj_yoy_trend":      round(proj9_revenue, 2),
             "acceleration_factor": round(acceleration, 2),
             "weekday_weights":     {int(k): round(v, 2) for k, v in wd_mult.items()},
             "calendar_shape_pct":  round((weight_remaining / days_remaining - 1) * 100, 1) if days_remaining > 0 else 0.0,
