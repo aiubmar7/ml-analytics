@@ -390,14 +390,40 @@ class MySalesExtractor:
         proj6_orders  = orders_so_far  + (daily_avg_orders  * weight_remaining)
 
         # ── Factor 7: Día de la semana del mes actual (10%) ─────
-        # Analiza si los días que quedan del mes son históricamente
-        # fuertes o débiles (basado en el patrón semanal ya calculado
-        # en el Factor 6). Es similar al F6 pero acotado al mes actual.
-        # Ventaja: elimina el sesgo de que septiembre arranque con más
-        # o menos fines de semana que agosto.
-        proj7_revenue = proj6_revenue   # ya usa el mismo mecanismo
-        proj7_units   = proj6_units
-        proj7_orders  = proj6_orders
+        # Igual al Factor 6 pero el patrón semanal se calcula SOLO con
+        # datos del mes actual (no los 120 días). Elimina el sesgo de
+        # meses anteriores estacionalmente diferentes.
+        proj7_revenue = proj1_revenue
+        proj7_units   = proj1_units
+        proj7_orders  = proj1_orders
+        try:
+            wd_mult_current = {wd: 1.0 for wd in range(7)}
+            if not df_paid.empty:
+                daily_cur = df_paid.groupby("date").agg(
+                    rev=("total_amount", "sum"),
+                    un=("quantity", "sum"),
+                    ords=("order_id", "nunique"),
+                ).reset_index()
+                daily_cur["wd"] = daily_cur["date"].apply(lambda d: d.weekday())
+                od7 = float(daily_cur["rev"].mean()) if not daily_cur.empty else daily_avg_revenue
+                if od7 > 0:
+                    for wd in range(7):
+                        sub7 = daily_cur[daily_cur["wd"] == wd]
+                        if not sub7.empty:
+                            wd_mult_current[wd] = float(sub7["rev"].mean()) / od7
+
+            weight_rem_7 = 0.0
+            for day_num in range(days_elapsed + 1, days_in_month + 1):
+                wd = date(today.year, today.month, day_num).weekday()
+                weight_rem_7 += wd_mult_current.get(wd, 1.0)
+
+            proj7_revenue = revenue_so_far + (daily_avg_revenue * weight_rem_7)
+            proj7_units   = units_so_far   + (daily_avg_units   * weight_rem_7)
+            proj7_orders  = orders_so_far  + (daily_avg_orders  * weight_rem_7)
+        except Exception:
+            proj7_revenue = proj6_revenue
+            proj7_units   = proj6_units
+            proj7_orders  = proj6_orders
 
         # ── Factor 8: Mismos días del mes anterior (15%) ──────────
         # Compara del 1 al N del mes actual vs del 1 al N del mes anterior.
@@ -407,31 +433,39 @@ class MySalesExtractor:
         proj8_units   = proj1_units
         proj8_orders  = proj1_orders
         try:
-            prev_month_8  = today.month - 1 if today.month > 1 else 12
-            prev_year_8   = today.year if today.month > 1 else today.year - 1
-            prev_days_8   = calendar.monthrange(prev_year_8, prev_month_8)[1]
+            prev_month_8 = today.month - 1 if today.month > 1 else 12
+            prev_year_8  = today.year if today.month > 1 else today.year - 1
+            prev_days_8  = calendar.monthrange(prev_year_8, prev_month_8)[1]
 
-            # Del 1 al days_elapsed del mes anterior
+            # Buscar mes anterior en df_all primero, si no en Dropbox
             df_same_days_prev = df_all[
                 (df_all["date"] >= date(prev_year_8, prev_month_8, 1)) &
                 (df_all["date"] <= date(prev_year_8, prev_month_8, min(days_elapsed, prev_days_8)))
             ]
-            # Total del mes anterior completo
             df_prev_full = df_all[
                 (df_all["date"] >= date(prev_year_8, prev_month_8, 1)) &
                 (df_all["date"] <= date(prev_year_8, prev_month_8, prev_days_8))
             ]
+
+            # Si no está en df_all, cargar desde Dropbox historial
+            if df_same_days_prev.empty or df_prev_full.empty:
+                df_hist_prev = self._load_historical_month(prev_year_8, prev_month_8)
+                if df_hist_prev is not None and not df_hist_prev.empty:
+                    df_hist_prev = df_hist_prev[df_hist_prev["status"] == "paid"].copy()
+                    if "date" not in df_hist_prev.columns:
+                        df_hist_prev["date"] = pd.to_datetime(df_hist_prev["date_created"]).dt.date
+                    df_same_days_prev = df_hist_prev[
+                        df_hist_prev["date"] <= date(prev_year_8, prev_month_8, min(days_elapsed, prev_days_8))
+                    ]
+                    df_prev_full = df_hist_prev
+
             if not df_same_days_prev.empty and not df_prev_full.empty:
-                rev_same_prev  = float(df_same_days_prev["total_amount"].sum())
-                rev_full_prev  = float(df_prev_full["total_amount"].sum())
+                rev_same_prev = float(df_same_days_prev["total_amount"].sum())
+                rev_full_prev = float(df_prev_full["total_amount"].sum())
                 if rev_same_prev > 0 and rev_full_prev > 0:
-                    # Ratio: cuánto representa el período parcial del total del mes anterior
-                    ratio_prev = rev_same_prev / rev_full_prev
-                    # Si el mes actual ya lleva la misma proporción, proyectar
-                    # el total del mes actual escalando el mes anterior por el crecimiento
-                    growth_8 = revenue_so_far / rev_same_prev if rev_same_prev > 0 else 1.0
+                    growth_8 = revenue_so_far / rev_same_prev
                     proj8_revenue = rev_full_prev * growth_8
-                    proj8_units   = float(df_prev_full["quantity"].sum()) * growth_8 if not df_prev_full.empty else proj1_units
+                    proj8_units   = float(df_prev_full["quantity"].sum()) * growth_8
                     proj8_orders  = df_prev_full["order_id"].nunique() * growth_8
         except Exception:
             pass
