@@ -470,43 +470,38 @@ class MySalesExtractor:
         except Exception:
             pass
 
-        # ── Factor 9: Tendencia interanual YoY (5%) ───────────────
-        # Si en los últimos meses venís creciendo X% respecto al año anterior,
-        # proyecta septiembre 2026 aplicando ese mismo % de crecimiento
-        # sobre septiembre 2025 (si está en Dropbox).
+        # ── Factor 9: Tendencia interanual YoY - mismos días (5%) ──
+        # Calcula el crecimiento YoY usando los MISMOS días del período
+        # actual vs el año anterior (no meses completos).
+        # Ej: si hoy es día 6 de sep, compara los 6 primeros días de
+        # sep 2026 vs los 6 primeros días de sep 2025.
+        # Esto captura el crecimiento real del período actual, no el
+        # arrastre de meses anteriores que pueden haber crecido más.
         proj9_revenue = proj1_revenue
         proj9_units   = proj1_units
         proj9_orders  = proj1_orders
         try:
-            # Calcular tasa de crecimiento YoY de los últimos 3 meses
-            yoy_rates = []
-            by, bm = today.year, today.month
-            for _ in range(3):
-                bm -= 1
-                if bm == 0:
-                    bm, by = 12, by - 1
-                bdim = calendar.monthrange(by, bm)[1]
-                # Mes actual
-                df_cur_m = df_all[
-                    (df_all["date"] >= date(by, bm, 1)) &
-                    (df_all["date"] <= date(by, bm, bdim))
+            # Días del mes actual transcurridos: del 1 al days_elapsed
+            # Mismo período año anterior desde Dropbox
+            df_ly_same = self._load_historical_month(today.year - 1, today.month)
+            if df_ly_same is not None and not df_ly_same.empty:
+                df_ly_same = df_ly_same[df_ly_same["status"] == "paid"].copy()
+                if "date" not in df_ly_same.columns:
+                    df_ly_same["date"] = pd.to_datetime(df_ly_same["date_created"]).dt.date
+                # Solo los mismos días transcurridos del año anterior
+                df_ly_period = df_ly_same[
+                    df_ly_same["date"] <= date(today.year - 1, today.month, min(days_elapsed, calendar.monthrange(today.year - 1, today.month)[1]))
                 ]
-                # Mismo mes año anterior desde Dropbox
-                df_prev_y = self._load_historical_month(by - 1, bm)
-                if df_cur_m is not None and not df_cur_m.empty and df_prev_y is not None and not df_prev_y.empty:
-                    df_prev_y_paid = df_prev_y[df_prev_y["status"] == "paid"]
-                    rev_cur  = float(df_cur_m["total_amount"].sum())
-                    rev_prev = float(df_prev_y_paid["total_amount"].sum())
-                    if rev_prev > 0 and rev_cur > 0:
-                        yoy_rates.append(rev_cur / rev_prev)
+                rev_ly_period = float(df_ly_period["total_amount"].sum()) if not df_ly_period.empty else 0
+                rev_ly_full   = float(df_ly_same["total_amount"].sum()) if not df_ly_same.empty else 0
 
-            if yoy_rates and ly_revenue and ly_revenue > 0:
-                # Promedio ponderado de tasas YoY (más reciente pesa más)
-                ws9 = list(range(len(yoy_rates), 0, -1))
-                avg_yoy = sum(w * r for w, r in zip(ws9, yoy_rates)) / sum(ws9)
-                proj9_revenue = ly_revenue * avg_yoy
-                proj9_units   = proj1_units * (proj9_revenue / proj1_revenue) if proj1_revenue > 0 else proj1_units
-                proj9_orders  = proj1_orders * (proj9_revenue / proj1_revenue) if proj1_revenue > 0 else proj1_orders
+                if rev_ly_period > 0 and rev_ly_full > 0 and revenue_so_far > 0:
+                    # Tasa de crecimiento YoY en los mismos días
+                    yoy_rate_real = revenue_so_far / rev_ly_period
+                    # Proyectar el mes completo: total año anterior * tasa real
+                    proj9_revenue = rev_ly_full * yoy_rate_real
+                    proj9_units   = proj1_units * (proj9_revenue / proj1_revenue) if proj1_revenue > 0 else proj1_units
+                    proj9_orders  = proj1_orders * (proj9_revenue / proj1_revenue) if proj1_revenue > 0 else proj1_orders
         except Exception:
             pass
 
