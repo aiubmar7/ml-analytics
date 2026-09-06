@@ -510,7 +510,7 @@ class MySalesExtractor:
         # P2 baja de 25% a 15% (P8 cubre mejor el inicio de mes).
         # P3 baja de 20% a 15% (P9 más preciso cuando hay historial YoY).
         # P7 = P6 en implementación pero con otro ángulo conceptual.
-        w1, w2, w3, w4, w5, w6, w7, w8, w9 = 0.10, 0.15, 0.15, 0.10, 0.10, 0.10, 0.10, 0.15, 0.05
+        w1, w2, w3, w4, w5, w6, w7, w8, w9 = 0.05, 0.10, 0.20, 0.05, 0.05, 0.10, 0.10, 0.20, 0.15
         forecast_revenue = (proj1_revenue * w1) + (proj2_revenue * w2) + (proj3_revenue * w3) + (proj4_revenue * w4) + (proj5_revenue * w5) + (proj6_revenue * w6) + (proj7_revenue * w7) + (proj8_revenue * w8) + (proj9_revenue * w9)
         forecast_units   = (proj1_units   * w1) + (proj2_units   * w2) + (proj3_units   * w3) + (proj4_units   * w4) + (proj5_units   * w5) + (proj6_units   * w6) + (proj7_units   * w7) + (proj8_units   * w8) + (proj9_units   * w9)
         forecast_orders  = (proj1_orders  * w1) + (proj2_orders  * w2) + (proj3_orders  * w3) + (proj4_orders  * w4) + (proj5_orders  * w5) + (proj6_orders  * w6) + (proj7_orders  * w7) + (proj8_orders  * w8) + (proj9_orders  * w9)
