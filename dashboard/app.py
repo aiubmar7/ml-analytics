@@ -251,21 +251,21 @@ if page == "🏠 Resumen":
                 f"A principio de mes se apoya más en el nivel base; sobre fin de mes, casi todo en la data real."
             )
 
-        with st.expander("🔍 Detalle del cálculo (6 factores)"):
+        with st.expander("🔍 Detalle del cálculo (9 factores)"):
             d1, d2, d3 = st.columns(3)
             with d1:
-                st.metric("1️⃣ Promedio diario del mes", fmt_currency(forecast["proj_daily_avg"]), help="Peso: 15%")
+                st.metric("1️⃣ Promedio diario del mes", fmt_currency(forecast["proj_daily_avg"]), help="Peso: 10%")
             with d2:
-                st.metric("2️⃣ Tendencia últimos 7 días", fmt_currency(forecast["proj_trend_7d"]), help="Peso: 25%")
+                st.metric("2️⃣ Tendencia últimos 7 días", fmt_currency(forecast["proj_trend_7d"]), help="Peso: 15%")
             with d3:
                 ly = forecast.get("last_year_revenue")
-                st.metric("3️⃣ Mismo mes año anterior", fmt_currency(ly) if ly else "Sin datos", help="Peso: 20%")
+                st.metric("3️⃣ Mismo mes año anterior", fmt_currency(ly) if ly else "Sin datos", help="Peso: 15%")
             d4, d5, d6 = st.columns(3)
             with d4:
                 seasonal = forecast.get("proj_seasonal")
                 yrs = forecast.get("seasonal_years", 0)
                 label = f"4️⃣ Estacionalidad ({yrs} años)" if yrs > 0 else "4️⃣ Estacionalidad histórica"
-                st.metric(label, fmt_currency(seasonal) if seasonal else "Sin datos", help="Peso: 15%")
+                st.metric(label, fmt_currency(seasonal) if seasonal else "Sin datos", help="Peso: 10%")
             with d5:
                 acc = forecast.get("acceleration_factor", 1.0)
                 arrow = "📈" if acc > 1 else "📉" if acc < 1 else "➡️"
@@ -275,7 +275,15 @@ if page == "🏠 Resumen":
                 shape = forecast.get("calendar_shape_pct", 0.0)
                 arrow6 = "📈" if shape > 0 else "📉" if shape < 0 else "➡️"
                 st.metric("6️⃣ Forma intra-mes (días)", fmt_currency(forecast.get("proj_calendar", 0)),
-                          delta=f"{arrow6} {shape:+.1f}% vs plano", help="Peso: 15%")
+                          delta=f"{arrow6} {shape:+.1f}% vs plano", help="Peso: 10%")
+            d7, d8, d9 = st.columns(3)
+            with d7:
+                st.metric("7️⃣ Día de la semana", fmt_currency(forecast.get("proj_weekday", 0)), help="Peso: 10%")
+            with d8:
+                st.metric("8️⃣ Mismos días mes anterior", fmt_currency(forecast.get("proj_same_days_prev", 0)), help="Peso: 15%")
+            with d9:
+                yoy = forecast.get("proj_yoy_trend", 0)
+                st.metric("9️⃣ Tendencia interanual YoY", fmt_currency(yoy) if yoy else "Sin datos", help="Peso: 5%")
             if forecast.get("vs_last_year_pct") is not None:
                 st.info(f"📊 Crecimiento vs mismo mes del año anterior: **{forecast['vs_last_year_pct']:+.1f}%**")
 
