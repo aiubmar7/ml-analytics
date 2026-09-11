@@ -312,27 +312,51 @@ class MySalesExtractor:
         # al promedio plano. Topeado 0.5x–3x.
         try:
             if ly_revenue and ly_revenue > 0 and df_ly_paid is not None:
+                # Ingreso de un mes de ESTE año: primero de la API (si el mes
+                # entró en la ventana), si no de Dropbox.
+                def _rev_curr(y, m):
+                    dim = calendar.monthrange(y, m)[1]
+                    r = float(df_all[
+                        (df_all["date"] >= date(y, m, 1)) &
+                        (df_all["date"] <= date(y, m, dim))
+                    ]["total_amount"].sum())
+                    if r > 0:
+                        return r
+                    dfh = self._load_historical_month(y, m)
+                    if dfh is not None and not dfh.empty:
+                        return float(dfh[dfh["status"] == "paid"]["total_amount"].sum())
+                    return 0.0
+
+                # Ingreso de un mes histórico (año pasado): Dropbox.
+                def _rev_hist(y, m):
+                    dfh = self._load_historical_month(y, m)
+                    if dfh is not None and not dfh.empty:
+                        return float(dfh[dfh["status"] == "paid"]["total_amount"].sum())
+                    return 0.0
+
+                # Camina hacia atrás y junta hasta 3 meses COMPLETOS que
+                # existan en AMBOS años. Robusto al hueco de meses no
+                # snapshoteados: si faltan jun–ago 2026, sigue hacia atrás
+                # (abr, mar, feb…) hasta completar 3 pares. Sigue siendo un
+                # ancla estable, sólo que apoyada en meses algo más viejos.
                 num_cur = den_prev = 0.0
+                pairs = 0
                 mm, yy = today.month, today.year
-                for _ in range(3):
+                for _ in range(8):
                     mm -= 1
                     if mm == 0:
                         mm, yy = 12, yy - 1
-                    dim = calendar.monthrange(yy, mm)[1]
-                    cur = float(df_all[
-                        (df_all["date"] >= date(yy, mm, 1)) &
-                        (df_all["date"] <= date(yy, mm, dim))
-                    ]["total_amount"].sum())
-                    df_py  = self._load_historical_month(yy - 1, mm)
-                    prevyr = 0.0
-                    if df_py is not None and not df_py.empty:
-                        prevyr = float(df_py[df_py["status"] == "paid"]["total_amount"].sum())
+                    cur    = _rev_curr(yy, mm)
+                    prevyr = _rev_hist(yy - 1, mm)
                     if cur > 0 and prevyr > 0:
                         num_cur  += cur
                         den_prev += prevyr
+                        pairs    += 1
+                        if pairs >= 3:
+                            break
 
                 if num_cur > 0 and den_prev > 0:
-                    growth = num_cur / den_prev              # YoY trimestral estable
+                    growth = num_cur / den_prev              # YoY estable multi-mes
                 else:
                     ly_dim    = calendar.monthrange(today.year - 1, today.month)[1]
                     ly_cutoff = date(today.year - 1, today.month, min(days_elapsed, ly_dim))
