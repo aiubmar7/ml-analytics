@@ -258,14 +258,19 @@ if page == "🏠 Resumen":
             with d2:
                 st.metric("2️⃣ Tendencia últimos 7 días", fmt_currency(forecast["proj_trend_7d"]), help="Peso: 15%")
             with d3:
-                ly = forecast.get("last_year_revenue")
-                st.metric("3️⃣ Mismo mes año anterior", fmt_currency(ly) if ly else "Sin datos", help="Peso: 15%")
+                proj_ly = forecast.get("proj_last_year")
+                raw_ly  = forecast.get("last_year_revenue")
+                st.metric("3️⃣ Mismo mes año anterior",
+                          fmt_currency(proj_ly) if proj_ly else "Sin datos",
+                          delta=(f"base {fmt_currency(raw_ly)}" if raw_ly else None),
+                          delta_color="off",
+                          help="Peso: 20% · total año pasado × crecimiento YoY del tramo")
             d4, d5, d6 = st.columns(3)
             with d4:
                 seasonal = forecast.get("proj_seasonal")
                 yrs = forecast.get("seasonal_years", 0)
                 label = f"4️⃣ Estacionalidad ({yrs} años)" if yrs > 0 else "4️⃣ Estacionalidad histórica"
-                st.metric(label, fmt_currency(seasonal) if seasonal else "Sin datos", help="Peso: 10%")
+                st.metric(label, fmt_currency(seasonal) if seasonal else "Sin datos", help="Peso: 5%")
             with d5:
                 acc = forecast.get("acceleration_factor", 1.0)
                 arrow = "📈" if acc > 1 else "📉" if acc < 1 else "➡️"
