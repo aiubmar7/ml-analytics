@@ -290,14 +290,9 @@ class MySalesExtractor:
         proj3_units   = proj1_units
         proj3_orders  = proj1_orders
         ly_revenue    = None
+        df_ly_paid    = None
 
-        # Año anterior desde historial Dropbox (mismo mes).
-        # FIX: antes crecía por daily_avg / (ly_revenue/dias_mes); ese
-        # divisor cancelaba ly_revenue y el factor colapsaba al promedio
-        # plano (= Factor 1), ignorando por completo el año pasado. Ahora
-        # crece el TOTAL del año pasado por la tasa YoY del MISMO tramo
-        # transcurrido (días 1..N), que sí refleja el crecimiento real.
-        # Topeada 0.5x–3x para que un arranque atípico no la dispare.
+        # Base: total del mismo mes del año pasado (Dropbox).
         try:
             df_ly = self._load_historical_month(today.year - 1, today.month)
             if df_ly is not None and not df_ly.empty:
@@ -305,16 +300,49 @@ class MySalesExtractor:
                 if "date" not in df_ly_paid.columns:
                     df_ly_paid["date"] = pd.to_datetime(df_ly_paid["date_created"]).dt.date
                 ly_revenue = float(df_ly_paid["total_amount"].sum())
+        except Exception:
+            pass
 
-                ly_dim    = calendar.monthrange(today.year - 1, today.month)[1]
-                ly_cutoff = date(today.year - 1, today.month, min(days_elapsed, ly_dim))
-                ly_period = float(df_ly_paid[df_ly_paid["date"] <= ly_cutoff]["total_amount"].sum())
+        # ANCLA ESTABLE (distinta de F9): crece ese total por el YoY de los
+        # últimos 3 meses COMPLETOS — 2026 desde la API (ventana 120d) y 2025
+        # desde Dropbox. Ese ritmo trimestral no se sacude con el arranque del
+        # mes en curso, así que ancla firme al año pasado. F9, en cambio, usa
+        # el tramo en curso y es la señal reactiva. Fallbacks: si falta
+        # histórico completo, cae al YoY del tramo (método de F9) y por último
+        # al promedio plano. Topeado 0.5x–3x.
+        try:
+            if ly_revenue and ly_revenue > 0 and df_ly_paid is not None:
+                num_cur = den_prev = 0.0
+                mm, yy = today.month, today.year
+                for _ in range(3):
+                    mm -= 1
+                    if mm == 0:
+                        mm, yy = 12, yy - 1
+                    dim = calendar.monthrange(yy, mm)[1]
+                    cur = float(df_all[
+                        (df_all["date"] >= date(yy, mm, 1)) &
+                        (df_all["date"] <= date(yy, mm, dim))
+                    ]["total_amount"].sum())
+                    df_py  = self._load_historical_month(yy - 1, mm)
+                    prevyr = 0.0
+                    if df_py is not None and not df_py.empty:
+                        prevyr = float(df_py[df_py["status"] == "paid"]["total_amount"].sum())
+                    if cur > 0 and prevyr > 0:
+                        num_cur  += cur
+                        den_prev += prevyr
 
-                if ly_revenue > 0 and ly_period > 0:
-                    yoy_rate = max(0.5, min(3.0, revenue_so_far / ly_period))
-                    proj3_revenue = ly_revenue * yoy_rate
-                    proj3_units   = float(df_ly_paid["quantity"].sum()) * yoy_rate
-                    proj3_orders  = df_ly_paid["order_id"].nunique()    * yoy_rate
+                if num_cur > 0 and den_prev > 0:
+                    growth = num_cur / den_prev              # YoY trimestral estable
+                else:
+                    ly_dim    = calendar.monthrange(today.year - 1, today.month)[1]
+                    ly_cutoff = date(today.year - 1, today.month, min(days_elapsed, ly_dim))
+                    ly_period = float(df_ly_paid[df_ly_paid["date"] <= ly_cutoff]["total_amount"].sum())
+                    growth    = (revenue_so_far / ly_period) if ly_period > 0 else 1.0
+
+                growth = max(0.5, min(3.0, growth))
+                proj3_revenue = ly_revenue * growth
+                proj3_units   = float(df_ly_paid["quantity"].sum()) * growth
+                proj3_orders  = df_ly_paid["order_id"].nunique()    * growth
         except Exception:
             pass
 
