@@ -36,6 +36,46 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+# ═══════════ TEMP diagnóstico F3 / formato parquet — BORRAR DESPUÉS ═══════════
+with st.expander("🔧 DIAG (temporal)", expanded=True):
+    try:
+        from storage.dropbox_client import DropboxClient as _DBX
+        _d = _DBX()
+
+        def _info(p):
+            df = _d.load_dataframe(p)
+            if df is None or df.empty:
+                st.write(f"`{p}` → VACÍO/None"); return
+            cols = list(df.columns)
+            has_status = "status" in cols
+            has_amount = "total_amount" in cols
+            paid = float(df[df["status"] == "paid"]["total_amount"].sum()) if (has_status and has_amount) else None
+            tot  = float(df["total_amount"].sum()) if has_amount else None
+            st.write(f"`{p}` | filas={len(df)} | status={'sí' if has_status else '❌ NO'} | paid={paid} | total={tot}")
+            st.write("   columnas:", cols)
+            if has_status:
+                st.write("   valores de status:", df["status"].value_counts().to_dict())
+
+        # Formato: uno que funciona (2025-09) vs uno del ancla (2026-04)
+        _info("data/historical/2025-09.parquet")
+        _info("data/historical/2026-04.parquet")
+
+        # Sumas por mes que vería F3 (paid si hay status, si no total) para
+        # entender el crecimiento del ancla.
+        st.write("──── sumas por mes (lo que ve F3) ────")
+        for (y, m) in [(2026, 4), (2026, 3), (2026, 2), (2025, 4), (2025, 3), (2025, 2)]:
+            df = _d.load_dataframe(f"data/historical/{y:04d}-{m:02d}.parquet")
+            if df is None or df.empty:
+                st.write(f"{y}-{m:02d}: —"); continue
+            if "status" in df.columns:
+                s = float(df[df["status"] == "paid"]["total_amount"].sum())
+            else:
+                s = float(df["total_amount"].sum())
+            st.write(f"{y}-{m:02d}: {s:,.0f}")
+    except Exception as _e:
+        st.error(f"DIAG error: {_e}")
+# ═══════════════════════════ fin TEMP ═══════════════════════════
+
 st.markdown("""
 <style>
 @import url('https://fonts.cdnfonts.com/css/samsung-sans');
