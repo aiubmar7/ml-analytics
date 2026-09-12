@@ -49,6 +49,30 @@ h2 { font-size: 20px !important; }
 h3 { font-size: 17px !important; }
 [data-testid="metric-container"] label { font-size: 13px !important; }
 [data-testid="metric-container"] [data-testid="stMetricValue"] { font-size: 20px !important; }
+
+/* Botón primario (Usar el pronóstico que erra menos): grande y minimalista */
+.stButton > button[kind="primary"],
+div[data-testid="stButton"] > button[kind="primary"] {
+    background: #14a06e !important;
+    color: #ffffff !important;
+    border: none !important;
+    border-radius: 12px !important;
+    padding: 18px 24px !important;
+    font-size: 16px !important;
+    font-weight: 600 !important;
+    letter-spacing: 0.2px !important;
+    box-shadow: 0 2px 10px rgba(20,160,110,0.25) !important;
+    transition: background 0.2s ease, transform 0.05s ease !important;
+}
+.stButton > button[kind="primary"]:hover,
+div[data-testid="stButton"] > button[kind="primary"]:hover {
+    background: #12b47c !important;
+    box-shadow: 0 4px 16px rgba(20,160,110,0.35) !important;
+}
+.stButton > button[kind="primary"]:active,
+div[data-testid="stButton"] > button[kind="primary"]:active {
+    transform: translateY(1px) !important;
+}
 </style>
 """, unsafe_allow_html=True)
 
