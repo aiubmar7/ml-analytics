@@ -36,45 +36,6 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# ═══════════ TEMP diagnóstico F3 / formato parquet — BORRAR DESPUÉS ═══════════
-with st.expander("🔧 DIAG (temporal)", expanded=True):
-    try:
-        from storage.dropbox_client import DropboxClient as _DBX
-        _d = _DBX()
-
-        def _info(p):
-            df = _d.load_dataframe(p)
-            if df is None or df.empty:
-                st.write(f"`{p}` → VACÍO/None"); return
-            cols = list(df.columns)
-            has_status = "status" in cols
-            has_amount = "total_amount" in cols
-            paid = float(df[df["status"] == "paid"]["total_amount"].sum()) if (has_status and has_amount) else None
-            tot  = float(df["total_amount"].sum()) if has_amount else None
-            st.write(f"`{p}` | filas={len(df)} | status={'sí' if has_status else '❌ NO'} | paid={paid} | total={tot}")
-            st.write("   columnas:", cols)
-            if has_status:
-                st.write("   valores de status:", df["status"].value_counts().to_dict())
-
-        # Formato: uno que funciona (2025-09) vs uno del ancla (2026-04)
-        _info("data/historical/2025-09.parquet")
-        _info("data/historical/2026-04.parquet")
-
-        # Sumas por mes que vería F3 (paid si hay status, si no total) para
-        # entender el crecimiento del ancla.
-        st.write("──── sumas por mes (lo que ve F3) ────")
-        for (y, m) in [(2026, 4), (2026, 3), (2026, 2), (2025, 4), (2025, 3), (2025, 2)]:
-            df = _d.load_dataframe(f"data/historical/{y:04d}-{m:02d}.parquet")
-            if df is None or df.empty:
-                st.write(f"{y}-{m:02d}: —"); continue
-            if "status" in df.columns:
-                s = float(df[df["status"] == "paid"]["total_amount"].sum())
-            else:
-                s = float(df["total_amount"].sum())
-            st.write(f"{y}-{m:02d}: {s:,.0f}")
-    except Exception as _e:
-        st.error(f"DIAG error: {_e}")
-# ═══════════════════════════ fin TEMP ═══════════════════════════
 
 st.markdown("""
 <style>
@@ -100,6 +61,47 @@ def get_clients():
         "keywords":    KeywordsExtractor(),
         "storage":     DropboxClient(),
     }
+
+
+def auto_capture_historial(clients, lookback_months=5):
+    """Captura sola los meses CERRADOS recientes que falten en
+    data/historical/. Baja ÚNICAMENTE lo que no existe: nunca pisa un mes
+    ya guardado ni toca el mes en curso. Streamlit Cloud no tiene cron, así
+    que esto corre al abrir el dashboard y hace de 'snapshot' automático.
+    Devuelve [(mes, nº órdenes), ...] de lo que capturó."""
+    storage = clients["storage"]
+    try:
+        existentes = set(storage.list_files("data/historical"))
+    except Exception:
+        return []
+    hoy = date.today()
+    y, m = hoy.year, hoy.month
+    capturados = []
+    for _ in range(lookback_months):
+        m -= 1
+        if m == 0:
+            y, m = y - 1, 12
+        fname = f"{y:04d}-{m:02d}.parquet"
+        if fname in existentes:
+            continue  # ya está: no re-descargar
+        ini = date(y, m, 1)
+        fin = date(y, m, calendar.monthrange(y, m)[1])
+        try:
+            df = clients["sales"].get_orders_by_daterange(ini, fin)
+            if df is not None and not df.empty:
+                storage.save_dataframe(df, f"data/historical/{fname}")
+                capturados.append((f"{y:04d}-{m:02d}", len(df)))
+        except Exception:
+            pass
+    return capturados
+
+
+# Captura automática (1 vez por sesión): descarga los meses cerrados que
+# falten. En sesiones donde no falta nada, es solo un listado de Dropbox.
+if "auto_snap" not in st.session_state:
+    st.session_state["auto_snap"] = auto_capture_historial(get_clients())
+    for _mes, _n in (st.session_state["auto_snap"] or []):
+        st.toast(f"📥 Historial capturado: {_mes} ({_n} órdenes)")
 
 st.sidebar.title("📊 ML Analytics")
 st.sidebar.markdown("---")
@@ -657,61 +659,93 @@ elif page == "📊 Reportes":
 # ══════════════════════════════════════════════════════════════════
 
 elif page == "🗄️ Historial":
-    st.title("🗄️ Carga de Historial")
+    st.title("🗄️ Historial")
     clients = get_clients()
 
-    st.info("Cargá datos históricos mes a mes en Dropbox. Solo necesitás hacerlo una vez por período.")
+    st.success(
+        "La captura del historial ahora es **automática**: cada vez que se abre el "
+        "dashboard se descargan de ML y se guardan en Dropbox los meses cerrados que "
+        "falten. No hay que cargar nada a mano."
+    )
 
-    col1, col2 = st.columns(2)
-    with col1:
-        fecha_desde = st.date_input("Desde", value=date(2024, 1, 1))
-    with col2:
-        fecha_hasta = st.date_input("Hasta", value=date.today())
+    # Qué se capturó en esta sesión (al arrancar)
+    cap = st.session_state.get("auto_snap") or []
+    if cap:
+        st.info("📥 En esta sesión se capturaron: " +
+                ", ".join(f"**{n}** ({c} órdenes)" for n, c in cap))
 
-    cargar_btn = st.button("📥 Cargar historial en Dropbox")
-
-    if cargar_btn:
-        if fecha_desde >= fecha_hasta:
-            st.error("La fecha de inicio debe ser anterior a la fecha final.")
-            st.stop()
-
+    # Estado: meses ya guardados
+    try:
+        archivos = sorted(clients["storage"].list_files("data/historical"))
+        meses = [a.replace(".parquet", "") for a in archivos if a.endswith(".parquet")]
+    except Exception as e:
         meses = []
-        current = date(fecha_desde.year, fecha_desde.month, 1)
-        while current <= fecha_hasta:
-            days_in_month = calendar.monthrange(current.year, current.month)[1]
-            mes_fin = date(current.year, current.month, min(days_in_month,
-                          fecha_hasta.day if current.year == fecha_hasta.year and current.month == fecha_hasta.month
-                          else days_in_month))
-            meses.append((current, mes_fin))
-            if current.month == 12:
-                current = date(current.year + 1, 1, 1)
-            else:
-                current = date(current.year, current.month + 1, 1)
+        st.error(f"No se pudo leer Dropbox: {e}")
 
-        st.info(f"Se cargarán **{len(meses)} meses** desde {fecha_desde} hasta {fecha_hasta}")
+    if meses:
+        st.write(f"**{len(meses)} meses guardados** en `data/historical/` "
+                 f"(de {meses[0]} a {meses[-1]}):")
+        st.write("  ·  ".join(meses))
+    else:
+        st.warning("Todavía no hay meses guardados.")
 
-        progress_bar = st.progress(0)
-        status_text  = st.empty()
-        results      = []
+    if st.button("🔄 Revisar y capturar meses faltantes ahora"):
+        nuevos = auto_capture_historial(clients, lookback_months=6)
+        if nuevos:
+            st.success("Capturados: " + ", ".join(f"{n} ({c})" for n, c in nuevos))
+        else:
+            st.info("No había meses cerrados faltantes al alcance de la API.")
+        st.rerun()
 
-        for i, (mes_inicio, mes_fin) in enumerate(meses):
-            label = mes_inicio.strftime("%B %Y")
-            status_text.text(f"Cargando {label}...")
-            try:
-                df = clients["sales"].get_orders_by_daterange(mes_inicio, mes_fin)
-                if not df.empty:
-                    path = f"data/historical/{mes_inicio.strftime('%Y-%m')}.parquet"
-                    clients["storage"].save_dataframe(df, path)
-                    results.append({"Mes": label, "Órdenes": len(df), "Estado": "OK"})
-                else:
-                    results.append({"Mes": label, "Órdenes": 0, "Estado": "Sin datos"})
-            except Exception as e:
-                results.append({"Mes": label, "Órdenes": 0, "Estado": f"Error: {str(e)[:50]}"})
-            progress_bar.progress((i + 1) / len(meses))
+    # Backfill manual de un rango — solo para casos puntuales.
+    with st.expander("🛠️ Backfill manual de un rango (avanzado)"):
+        st.caption("Reescribe los meses del rango en Dropbox. Útil para recuperar "
+                   "un mes puntual; ojo que pisa lo existente.")
+        c1, c2 = st.columns(2)
+        with c1:
+            fecha_desde = st.date_input("Desde", value=date(2025, 5, 1))
+        with c2:
+            fecha_hasta = st.date_input("Hasta", value=date.today())
 
-        status_text.text("Carga completada")
-        st.success(f"Historial cargado. {len([r for r in results if r['Estado'] == 'OK'])} meses exitosos.")
-        st.dataframe(pd.DataFrame(results), use_container_width=True, hide_index=True)
+        if st.button("📥 Cargar ese rango en Dropbox"):
+            if fecha_desde >= fecha_hasta:
+                st.error("La fecha de inicio debe ser anterior a la fecha final.")
+                st.stop()
+
+            meses_r = []
+            current = date(fecha_desde.year, fecha_desde.month, 1)
+            while current <= fecha_hasta:
+                dim = calendar.monthrange(current.year, current.month)[1]
+                mes_fin = date(current.year, current.month,
+                    min(dim, fecha_hasta.day)
+                    if (current.year, current.month) == (fecha_hasta.year, fecha_hasta.month)
+                    else dim)
+                meses_r.append((current, mes_fin))
+                current = (date(current.year + 1, 1, 1) if current.month == 12
+                           else date(current.year, current.month + 1, 1))
+
+            st.info(f"Se cargarán **{len(meses_r)} meses** desde {fecha_desde} hasta {fecha_hasta}")
+            progress_bar = st.progress(0)
+            status_text  = st.empty()
+            results      = []
+            for i, (mes_inicio, mes_fin) in enumerate(meses_r):
+                label = mes_inicio.strftime("%Y-%m")
+                status_text.text(f"Cargando {label}...")
+                try:
+                    df = clients["sales"].get_orders_by_daterange(mes_inicio, mes_fin)
+                    if df is not None and not df.empty:
+                        path = f"data/historical/{mes_inicio.strftime('%Y-%m')}.parquet"
+                        clients["storage"].save_dataframe(df, path)
+                        results.append({"Mes": label, "Órdenes": len(df), "Estado": "OK"})
+                    else:
+                        results.append({"Mes": label, "Órdenes": 0, "Estado": "Sin datos"})
+                except Exception as e:
+                    results.append({"Mes": label, "Órdenes": 0, "Estado": f"Error: {str(e)[:50]}"})
+                progress_bar.progress((i + 1) / len(meses_r))
+
+            status_text.text("Carga completada")
+            st.success(f"{len([r for r in results if r['Estado'] == 'OK'])} meses cargados.")
+            st.dataframe(pd.DataFrame(results), use_container_width=True, hide_index=True)
 
 
 # ══════════════════════════════════════════════════════════════════
