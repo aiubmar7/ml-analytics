@@ -34,6 +34,7 @@ class MySalesExtractor:
         self.storage = DropboxClient()
         self.user_id = None
         self._orders_cache = {}   # {days_back: (timestamp, df)} cache con TTL
+        self._hist_cache   = {}   # {(year, month): df} cache de meses históricos
 
     def _get_user_id(self) -> str:
         if not self.user_id:
@@ -216,7 +217,10 @@ class MySalesExtractor:
         }
 
     def _load_historical_month(self, year: int, month: int) -> pd.DataFrame:
-        """Carga un mes desde Dropbox historial."""
+        """Carga un mes desde Dropbox historial (con cache en memoria)."""
+        key = (year, month)
+        if key in self._hist_cache:
+            return self._hist_cache[key]
         try:
             path = f"data/historical/{year:04d}-{month:02d}.parquet"
             df = self.storage.load_dataframe(path)
@@ -225,12 +229,17 @@ class MySalesExtractor:
                 df["date"] = df["date_created"].dt.date
                 if "net_amount" not in df.columns:
                     df["net_amount"] = df["total_amount"] - df.get("sale_fee", 0)
+            self._hist_cache[key] = df
             return df
         except Exception:
             return None
 
-    def get_monthly_forecast(self) -> dict:
-        today          = _today_uy()
+    def get_monthly_forecast(self, as_of=None, data_override=None, weights_by_bucket=None) -> dict:
+        # as_of / data_override permiten re-correr el MISMO cálculo para una
+        # fecha de corte pasada con datos históricos (lo usa el backtest, así
+        # nunca se desincroniza de producción). weights_by_bucket habilita
+        # pesos que varían por fase del mes (C/D). Todo default = producción.
+        today          = as_of if as_of is not None else _today_uy()
         days_in_month  = calendar.monthrange(today.year, today.month)[1]
         days_elapsed   = today.day
         days_remaining = days_in_month - days_elapsed
@@ -239,11 +248,11 @@ class MySalesExtractor:
         # mes previo, ventana del Factor 6 y nivel base salen de acá.
         # Antes se bajaba en 3 pulls separados que se solapaban y
         # enlentecían (a veces colgaban) la carga de la página.
-        df_all = self.get_orders(120)
+        df_all = data_override if data_override is not None else self.get_orders(120)
         if df_all is None or df_all.empty:
             return {"error": "Sin datos suficientes para proyectar"}
         df_all = df_all[df_all["status"] == "paid"].copy()
-        df_all["date"] = df_all["date_created"].dt.date
+        df_all["date"] = pd.to_datetime(df_all["date_created"]).dt.date
 
         df_paid = df_all[df_all["date"] >= date(today.year, today.month, 1)].copy()
         if df_paid.empty:
@@ -592,7 +601,17 @@ class MySalesExtractor:
         # P2 baja de 25% a 15% (P8 cubre mejor el inicio de mes).
         # P3 baja de 20% a 15% (P9 más preciso cuando hay historial YoY).
         # P7 = P6 en implementación pero con otro ángulo conceptual.
-        w1, w2, w3, w4, w5, w6, w7, w8, w9 = 0.05, 0.10, 0.20, 0.05, 0.05, 0.10, 0.10, 0.20, 0.15
+        # Pesos: por defecto los base. Si viene weights_by_bucket, elige por
+        # fase del mes (temprano ≤10, medio ≤20, tarde >20) — esto habilita
+        # D (pesos que varían con el día) y C (optimizados por el backtest).
+        _default_w = [0.05, 0.10, 0.20, 0.05, 0.05, 0.10, 0.10, 0.20, 0.15]
+        wv = _default_w
+        if weights_by_bucket:
+            bucket = "early" if days_elapsed <= 10 else ("mid" if days_elapsed <= 20 else "late")
+            cand = weights_by_bucket.get(bucket) or weights_by_bucket.get("all")
+            if cand and len(cand) == 9 and abs(sum(cand) - 1.0) < 0.05:
+                wv = list(cand)
+        w1, w2, w3, w4, w5, w6, w7, w8, w9 = wv
         forecast_revenue = (proj1_revenue * w1) + (proj2_revenue * w2) + (proj3_revenue * w3) + (proj4_revenue * w4) + (proj5_revenue * w5) + (proj6_revenue * w6) + (proj7_revenue * w7) + (proj8_revenue * w8) + (proj9_revenue * w9)
         forecast_units   = (proj1_units   * w1) + (proj2_units   * w2) + (proj3_units   * w3) + (proj4_units   * w4) + (proj5_units   * w5) + (proj6_units   * w6) + (proj7_units   * w7) + (proj8_units   * w8) + (proj9_units   * w9)
         forecast_orders  = (proj1_orders  * w1) + (proj2_orders  * w2) + (proj3_orders  * w3) + (proj4_orders  * w4) + (proj5_orders  * w5) + (proj6_orders  * w6) + (proj7_orders  * w7) + (proj8_orders  * w8) + (proj9_orders  * w9)
@@ -668,33 +687,22 @@ class MySalesExtractor:
             "daily_trend_revenue": round(daily_trend_revenue, 2),
         }
 
-    def backtest_forecast(self, months_back: int = 6, cutoffs=(5, 10, 15, 20)) -> dict:
-        """
-        Backtest del pronóstico: re-corre la proyección como si fuera el
-        día X de meses ya cerrados y mide el error (MAPE) contra el total
-        real de cada mes.
+    def backtest_forecast(self, months_back: int = 12, cutoffs=(5, 10, 15, 20, 25)) -> dict:
+        """Backtest REAL. Re-corre get_monthly_forecast() —la MISMA función de
+        producción, con los 10 factores y sus pesos— como si fuera el día X de
+        meses ya cerrados, alimentándola con el historial de Dropbox, y compara
+        el pronóstico contra el total real del mes.
 
-        Solo backtestea los factores reproducibles con la data de la API:
-          - proj1 (promedio diario), proj2 (tendencia 7d),
-            proj5 (velocidad), proj6 (forma intra-mes).
-        Los factores 3 (año anterior) y 4 (estacionalidad) dependen de
-        historial en Dropbox que no existe para meses pasados; en el
-        ensemble actual colapsan al factor 1 (igual que en producción),
-        por eso el peso efectivo de proj1 es w1+w3+w4 = 0.50.
-
-        Optimizado: baja el peso por día de la semana una sola vez y
-        cada mes a testear una sola vez (sin solapamientos), para
-        minimizar las llamadas a la API.
-
-        Devuelve: MAPE por factor, MAPE del ensemble con los pesos
-        actuales, y los pesos óptimos que minimizan el MAPE sobre estos
-        datos (búsqueda en grilla sobre el símplex).
+        A diferencia de la versión vieja (que reimplementaba 4 factores con
+        pesos viejos y se desincronizaba), esto mide exactamente lo que corre
+        en producción. Devuelve MAPE global y por día de corte, y las muestras
+        (proyección de cada factor + real) para poder optimizar los pesos sin
+        re-correr el pronóstico.
         """
         import numpy as np
-
         today = _today_uy()
 
-        # Meses completos a testear (excluye el mes actual)
+        # Meses cerrados a testear (excluye el mes en curso)
         months = []
         y, m = today.year, today.month
         for _ in range(months_back):
@@ -703,203 +711,136 @@ class MySalesExtractor:
                 m, y = 12, y - 1
             months.append((y, m))
 
-        # ── Peso por día de la semana: se calcula UNA sola vez ────
-        # (en vez de re-bajarlo por cada mes). El patrón semanal es
-        # estable, así que usar una ventana reciente única es buena
-        # aproximación y baja muchísimo las llamadas a la API.
-        wd_mult_global = {wd: 1.0 for wd in range(7)}
-        try:
-            df_wd = self.get_orders(120)
-            df_wd = df_wd[df_wd["status"] == "paid"].copy()
-            df_wd["date"] = df_wd["date_created"].dt.date
-            daily_wd = df_wd.groupby("date")["total_amount"].sum().reset_index()
-            daily_wd["wd"] = daily_wd["date"].apply(lambda d: d.weekday())
-            od = float(daily_wd["total_amount"].mean()) if not daily_wd.empty else 0.0
-            if od > 0:
-                for wd in range(7):
-                    sub = daily_wd[daily_wd["wd"] == wd]
-                    if not sub.empty:
-                        wd_mult_global[wd] = float(sub["total_amount"].mean()) / od
-        except Exception:
-            pass
+        samples = []
+        errs_by_cut = {c: [] for c in cutoffs}
 
-        samples = []          # [p1, p2, p5, p6, actual]
-        sample_cuts = []      # día de corte K de cada muestra
-        sample_alpha = []     # α = K/dim de cada muestra
-        sample_base = []      # nivel base del mes (o NaN si no hay)
-        tested_months = set()
-
-        # Bajar los meses a testear + los 3 previos al más viejo (para el
-        # nivel base del blend). Cada mes se baja UNA sola vez.
-        all_months = list(months)
-        ey, em = months[-1]              # mes más viejo a testear
-        for _ in range(3):
-            em -= 1
-            if em == 0:
-                em, ey = 12, ey - 1
-            all_months.append((ey, em))
-
-        month_df, month_total = {}, {}
-        for (yy, mm) in all_months:
-            dim = calendar.monthrange(yy, mm)[1]
-            try:
-                dfm = self.get_orders_by_daterange(date(yy, mm, 1), date(yy, mm, dim))
-            except Exception:
+        for (my, mm) in months:
+            dfm = self._load_historical_month(my, mm)
+            if dfm is None or dfm.empty:
                 continue
-            if dfm.empty or "date" not in dfm.columns:
+            dfm_paid = dfm[dfm["status"] == "paid"].copy()
+            if "date" not in dfm_paid.columns:
+                dfm_paid["date"] = pd.to_datetime(dfm_paid["date_created"]).dt.date
+            actual = float(dfm_paid["total_amount"].sum())
+            if actual <= 0:
                 continue
-            dfm = dfm[dfm["status"] == "paid"].copy()
-            month_df[(yy, mm)]    = dfm
-            month_total[(yy, mm)] = float(dfm["total_amount"].sum())
+            dim = calendar.monthrange(my, mm)[1]
 
-        def _baseline_for(yy, mm):
-            """Promedio de los 3 meses previos, ponderado por recencia."""
-            vals = []
-            py, pm = yy, mm
-            for _ in range(3):
+            # Meses previos completos (para F2/F6/F8 y el ancla de F3)
+            prev_frames = []
+            pm, py = mm, my
+            for _ in range(4):
                 pm -= 1
                 if pm == 0:
                     pm, py = 12, py - 1
-                t = month_total.get((py, pm))
-                if t and t > 0:
-                    vals.append(t)
-            if not vals:
-                return None
-            ws = list(range(len(vals), 0, -1))   # el más reciente pesa más
-            return sum(w * v for w, v in zip(ws, vals)) / float(sum(ws))
+                dfp = self._load_historical_month(py, pm)
+                if dfp is not None and not dfp.empty:
+                    prev_frames.append(dfp)
 
-        for (yy, mm) in months:
-            dim    = calendar.monthrange(yy, mm)[1]
-            df_m   = month_df.get((yy, mm))
-            actual = month_total.get((yy, mm), 0.0)
-            if df_m is None or df_m.empty or actual <= 0:
-                continue
-            base_m = _baseline_for(yy, mm)
-
-            for K in cutoffs:
-                if K >= dim:
+            for c in cutoffs:
+                if c >= dim:
                     continue
-                cutoff = date(yy, mm, K)
-                df_el  = df_m[df_m["date"] <= cutoff]
-                if df_el.empty:
+                cutoff_date = date(my, mm, c)
+                dfm_cut = dfm_paid[dfm_paid["date"] <= cutoff_date]
+                if dfm_cut.empty:
                     continue
-                rev_sf = float(df_el["total_amount"].sum())
-                if rev_sf <= 0:
+                frames = [dfm_cut] + prev_frames
+                data_override = pd.concat(frames, ignore_index=True)
+                fc = self.get_monthly_forecast(as_of=cutoff_date, data_override=data_override)
+                if not fc or "error" in fc:
                     continue
+                pred = fc.get("forecast_revenue")
+                if not pred or pred <= 0:
+                    continue
+                errs_by_cut[c].append(abs(pred - actual) / actual)
+                samples.append({
+                    "day": c, "dim": dim, "actual": actual,
+                    "p": [fc["proj_daily_avg"], fc["proj_trend_7d"], fc["proj_last_year"],
+                          fc["proj_seasonal"], fc["proj_acceleration"], fc["proj_calendar"],
+                          fc["proj_weekday"], fc["proj_same_days_prev"], fc["proj_yoy_trend"]],
+                })
 
-                days_rem  = dim - K
-                daily_avg = rev_sf / K
-
-                # Factor 1: promedio diario plano
-                p1 = rev_sf + daily_avg * days_rem
-
-                # Factor 2: tendencia 7 días previos al corte
-                last7 = df_el[df_el["date"] >= (cutoff - timedelta(days=6))]
-                d7    = max(len(last7["date"].unique()), 1)
-                trend = float(last7["total_amount"].sum()) / d7
-                p2    = rev_sf + trend * days_rem
-
-                # Factor 5: aceleración (últ. 3d vs días 4-10 dentro del mes)
-                l3 = df_el[df_el["date"] >= (cutoff - timedelta(days=2))]
-                pp = df_el[(df_el["date"] >= (cutoff - timedelta(days=9))) &
-                           (df_el["date"] <  (cutoff - timedelta(days=2)))]
-                d3 = max(len(l3["date"].unique()), 1)
-                dp = max(len(pp["date"].unique()), 1)
-                a3 = float(l3["total_amount"].sum()) / d3 if not l3.empty else daily_avg
-                ap = float(pp["total_amount"].sum()) / dp if not pp.empty else daily_avg
-                accel = max(0.5, min(2.0, a3 / ap if ap > 0 else 1.0))
-                p5 = rev_sf + daily_avg * accel * days_rem
-
-                # Factor 6: forma intra-mes (usa el peso por día calculado una vez)
-                wr = 0.0
-                for dn in range(K + 1, dim + 1):
-                    wr += wd_mult_global.get(date(yy, mm, dn).weekday(), 1.0)
-                p6 = rev_sf + daily_avg * wr
-
-                samples.append([p1, p2, p5, p6, actual])
-                sample_cuts.append(K)
-                sample_alpha.append(K / dim)
-                sample_base.append(base_m if base_m else np.nan)
-                tested_months.add((yy, mm))
-
-        if not samples:
-            return {"samples": 0, "months_tested": 0, "cutoffs": list(cutoffs),
-                    "error": "No hay meses cerrados con datos suficientes en la ventana de la API"}
-
-        arr    = np.array(samples, dtype=float)   # (n, 5)
-        P      = arr[:, :4]                        # p1, p2, p5, p6
-        y_true = arr[:, 4]
-
-        def mape(pred):
-            return float(np.mean(np.abs(pred - y_true) / y_true) * 100)
-
-        factor_mape = {
-            "proj1": mape(P[:, 0]),
-            "proj2": mape(P[:, 1]),
-            "proj5": mape(P[:, 2]),
-            "proj6": mape(P[:, 3]),
-        }
-
-        # Ensemble con pesos ACTUALES (3 y 4 colapsan a p1):
-        # efectivo -> p1=w1+w3+w4=0.50, p2=0.25, p5=0.05, p6=0.20
-        w_cur   = np.array([0.50, 0.25, 0.05, 0.20])
-        ens_cur = mape(P @ w_cur)
-
-        # Pesos óptimos: grilla sobre el símplex (paso 0.05) que minimiza MAPE
-        step = 0.05
-        n    = int(round(1 / step))
-        best_w, best_mape = w_cur, ens_cur
-        for a in range(n + 1):
-            for b in range(n + 1 - a):
-                for c in range(n + 1 - a - b):
-                    d = n - a - b - c
-                    w = np.array([a, b, c, d], dtype=float) * step
-                    mp = mape(P @ w)
-                    if mp < best_mape:
-                        best_mape, best_w = mp, w
-
-        # MAPE del ensemble actual separado por día de corte.
-        # Dice a partir de qué día del mes el pronóstico ya es confiable.
-        cuts_arr = np.array(sample_cuts)
-        ens_pred = P @ w_cur
-        mape_by_cutoff = {}
-        for K in sorted(set(sample_cuts)):
-            mask = cuts_arr == K
-            if mask.any():
-                err = np.abs(ens_pred[mask] - y_true[mask]) / y_true[mask]
-                mape_by_cutoff[int(K)] = round(float(np.mean(err) * 100), 1)
-
-        # Mismo cálculo pero CON el blend por confianza:
-        #   pred = α·ensemble + (1-α)·nivel_base   (α = K/dim)
-        base_arr  = np.array(sample_base, dtype=float)
-        alpha_arr = np.array(sample_alpha, dtype=float)
-        have_base = ~np.isnan(base_arr)
-        blend_pred = ens_pred.copy()
-        blend_pred[have_base] = (alpha_arr[have_base] * ens_pred[have_base] +
-                                 (1.0 - alpha_arr[have_base]) * base_arr[have_base])
-        ens_blend = float(np.mean(np.abs(blend_pred - y_true) / y_true) * 100)
-        mape_by_cutoff_blend = {}
-        for K in sorted(set(sample_cuts)):
-            mask = cuts_arr == K
-            if mask.any():
-                err = np.abs(blend_pred[mask] - y_true[mask]) / y_true[mask]
-                mape_by_cutoff_blend[int(K)] = round(float(np.mean(err) * 100), 1)
+        mape_by_cutoff = {c: round(float(np.mean(v)) * 100, 1) for c, v in errs_by_cut.items() if v}
+        all_errs = [e for v in errs_by_cut.values() for e in v]
+        mape_global = round(float(np.mean(all_errs)) * 100, 1) if all_errs else None
 
         return {
-            "samples":                 len(samples),
-            "months_tested":           len(tested_months),
-            "cutoffs":                 list(cutoffs),
-            "factor_mape":             {k: round(v, 1) for k, v in factor_mape.items()},
-            "ensemble_mape_current":   round(ens_cur, 1),
-            "ensemble_mape_optimized": round(best_mape, 1),
-            "ensemble_mape_blend":     round(ens_blend, 1),
-            "mape_by_cutoff":          mape_by_cutoff,
-            "mape_by_cutoff_blend":    mape_by_cutoff_blend,
-            "current_weights_eff":     {"proj1": 0.50, "proj2": 0.25, "proj5": 0.05, "proj6": 0.20},
-            "optimized_weights":       {
-                "proj1": round(float(best_w[0]), 2),
-                "proj2": round(float(best_w[1]), 2),
-                "proj5": round(float(best_w[2]), 2),
-                "proj6": round(float(best_w[3]), 2),
-            },
+            "months_tested": len([1 for (my, mm) in months
+                                  if self._load_historical_month(my, mm) is not None]),
+            "samples":       len(samples),
+            "cutoffs":       list(cutoffs),
+            "mape_global":   mape_global,
+            "mape_by_cutoff": mape_by_cutoff,
+            "_samples":      samples,
         }
+
+    @staticmethod
+    def _mape_of_weights(w, subset):
+        """MAPE de un vector de pesos sobre un subconjunto de muestras,
+        replicando el ensemble + Factor 10 tal como producción."""
+        import numpy as np
+        if not subset:
+            return None
+        errs = []
+        for s in subset:
+            p   = s["p"]
+            ens = float(np.dot(w, p))
+            tgt = (p[2] + p[7] + p[8]) / 3.0                       # F10 target = prom(F3,F8,F9)
+            lam = max(0.0, min(0.5, (1.0 - s["day"] / s["dim"]) * 0.5))
+            pred = ens * (1 - lam) + tgt * lam
+            errs.append(abs(pred - s["actual"]) / s["actual"])
+        return float(np.mean(errs))
+
+    def optimize_weights(self, samples) -> dict:
+        """Busca los pesos (9 factores, símplex: ≥0 y suman 1) que minimizan el
+        MAPE del backtest. Coordinate descent: mueve peso entre factores en
+        pasos decrecientes. Optimiza por fase del mes (temprano/medio/tarde) —
+        eso es D — y también un vector global. NO cambia producción; solo
+        sugiere. Los pesos se aplican aparte, guardándolos en Dropbox."""
+        import numpy as np
+        if not samples:
+            return {}
+        base = np.array([0.05, 0.10, 0.20, 0.05, 0.05, 0.10, 0.10, 0.20, 0.15])
+
+        def optimize(subset):
+            if len(subset) < 3:                                    # muy pocas muestras: no optimizar
+                return None, None
+            w    = base.copy()
+            best = self._mape_of_weights(w, subset)
+            step = 0.05
+            for _ in range(300):
+                improved = False
+                for i in range(9):
+                    for j in range(9):
+                        if i == j or w[i] - step < 0:
+                            continue
+                        cand = w.copy(); cand[i] -= step; cand[j] += step
+                        mp = self._mape_of_weights(cand, subset)
+                        if mp is not None and mp < best - 1e-9:
+                            w, best, improved = cand, mp, True
+                if not improved:
+                    step /= 2.0
+                    if step < 0.01:
+                        break
+            return w, best
+
+        out = {"weights_by_bucket": {}, "mape_by_bucket": {}}
+        groups = {
+            "early": [s for s in samples if s["day"] <= 10],
+            "mid":   [s for s in samples if 10 < s["day"] <= 20],
+            "late":  [s for s in samples if s["day"] > 20],
+        }
+        for name, sub in groups.items():
+            w, mp = optimize(sub)
+            if w is not None:
+                out["weights_by_bucket"][name] = [round(float(x), 3) for x in w]
+                out["mape_by_bucket"][name] = {
+                    "base": round(self._mape_of_weights(base, sub) * 100, 1),
+                    "opt":  round(mp * 100, 1),
+                    "n":    len(sub),
+                }
+        wg, mpg = optimize(samples)
+        out["weights_global"]    = [round(float(x), 3) for x in wg] if wg is not None else None
+        out["mape_global_base"]  = round(self._mape_of_weights(base, samples) * 100, 1)
+        out["mape_global_opt"]   = round(mpg * 100, 1) if mpg else None
+        return out
