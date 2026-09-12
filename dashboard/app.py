@@ -96,11 +96,48 @@ def auto_capture_historial(clients, lookback_months=5):
     return capturados
 
 
+def _auto_apply_weights(clients, bt, opt):
+    """Aplica los pesos optimizados a producción SOLO si pasan las guardas
+    (reemplazan al botón manual como red de seguridad). Si no pasan, no toca
+    nada. Respeta 'auto: false' si el usuario pausó la auto-optimización."""
+    try:
+        cur = clients["storage"].load_json("config/forecast_weights.json") or {}
+    except Exception:
+        cur = {}
+    if cur.get("auto") is False:          # el usuario pausó la auto-optimización
+        return None
+    if not opt or not opt.get("weights_by_bucket"):
+        return None
+    # Guardas a nivel backtest: datos pobres o error absurdo -> no tocar.
+    if not bt or bt.get("samples", 0) < 20:
+        return None
+    if (bt.get("mape_global") or 999) > 40:          # posible data corrupta
+        return None
+    good = {}
+    for b, w in opt["weights_by_bucket"].items():
+        mp = opt.get("mape_by_bucket", {}).get(b, {})
+        if mp.get("n", 0) < 8:                        # muy pocas muestras en la fase
+            continue
+        if (mp.get("base", 0) - mp.get("opt", 0)) < 1.0:   # mejora chica: dejar base
+            continue
+        if abs(sum(w) - 1.0) > 0.05 or max(w) > 0.75 or min(w) < 0:  # pesos degenerados
+            continue
+        good[b] = w
+    try:
+        clients["storage"].save_json(
+            {"weights_by_bucket": (good or None), "auto": True,
+             "ts": datetime.now().timestamp()},
+            "config/forecast_weights.json")
+    except Exception:
+        return None
+    return good
+
+
 def get_backtest_cached(clients, months_back=12, max_age_h=24, force=False):
     """Backtest automático con cache en Dropbox: lo corre solo si no hay
-    resultado guardado o si el guardado tiene más de max_age_h horas. Así no
-    se re-ejecuta (60s) en cada interacción ni se pierde al recargar. Devuelve
-    (result, edad_horas). result incluye 'samples' para el optimizador."""
+    resultado guardado o si el guardado tiene más de max_age_h horas. En cada
+    corrida fresca también optimiza y AUTO-APLICA los pesos (con guardas).
+    Devuelve (result, edad_horas, opt)."""
     path = "config/backtest_cache.json"
     if not force:
         try:
@@ -108,21 +145,28 @@ def get_backtest_cached(clients, months_back=12, max_age_h=24, force=False):
             if cached and cached.get("ts") and cached.get("months_back") == months_back:
                 age = (datetime.now().timestamp() - cached["ts"]) / 3600.0
                 if age < max_age_h:
-                    return cached.get("result", {}), age
+                    return cached.get("result", {}), age, cached.get("opt")
         except Exception:
             pass
     # correr fresco
     try:
         res = clients["sales"].backtest_forecast(months_back=months_back, cutoffs=(5, 10, 15, 20, 25))
     except Exception as e:
-        return {"error": str(e)}, 0.0
-    # guardar (los samples son chicos: ~60 x 9 floats)
+        return {"error": str(e)}, 0.0, None
+    # optimizar + auto-aplicar (con guardas)
+    opt = None
+    try:
+        opt = clients["sales"].optimize_weights(res.get("_samples", []))
+        _auto_apply_weights(clients, res, opt)
+    except Exception:
+        opt = None
     try:
         clients["storage"].save_json(
-            {"ts": datetime.now().timestamp(), "months_back": months_back, "result": res}, path)
+            {"ts": datetime.now().timestamp(), "months_back": months_back,
+             "result": res, "opt": opt}, path)
     except Exception:
         pass
-    return res, 0.0
+    return res, 0.0, opt
 
 
 # Captura automática (1 vez por sesión): descarga los meses cerrados que
@@ -294,9 +338,10 @@ if page == "🏠 Resumen":
     # Lo usan el rango (📏) y el panel de más abajo. Sin botón.
     if "bt_auto" not in st.session_state:
         with st.spinner("Midiendo el error del pronóstico (backtest)..."):
-            _btr, _btage = get_backtest_cached(clients, months_back=12)
+            _btr, _btage, _bopt = get_backtest_cached(clients, months_back=12)
         st.session_state["bt_auto"] = _btr
         st.session_state["bt_age"]  = _btage
+        st.session_state["opt_auto"] = _bopt
     bt = st.session_state.get("bt_auto")
 
     if "error" in forecast:
@@ -425,38 +470,48 @@ if page == "🏠 Resumen":
     st.caption("Corre solo (una vez por día) re-ejecutando la MISMA función de producción "
                "sobre los meses cerrados y midiendo el error % contra el total real. Sin botón.")
 
-    # Estado de pesos activos
-    _active = None
+    # Estado de la auto-optimización de pesos
+    _cfg = {}
     try:
-        _c = clients["storage"].load_json("config/forecast_weights.json")
-        if _c and _c.get("weights_by_bucket"):
-            _active = _c["weights_by_bucket"]
+        _cfg = clients["storage"].load_json("config/forecast_weights.json") or {}
     except Exception:
-        _active = None
-    if _active:
-        st.success("✅ Pronóstico usando **pesos optimizados** (por fase del mes). "
-                   f"Buckets guardados: {', '.join(_active.keys())}.")
-        if st.button("↩️ Volver a los pesos base"):
-            try:
-                clients["storage"].save_json({"weights_by_bucket": None}, "config/forecast_weights.json")
-                st.success("Restaurados los pesos base."); st.rerun()
-            except Exception as e:
-                st.error(f"No se pudo restaurar: {e}")
+        _cfg = {}
+    _active  = _cfg.get("weights_by_bucket")
+    _auto_on = _cfg.get("auto", True)   # default: encendida
+
+    if _auto_on and _active:
+        st.success("✅ **Pesos auto-optimizados por fase** en uso. Se reajustan solos cada vez que "
+                   f"corre el backtest, si mejoran y pasan las guardas. Fases activas: {', '.join(_active.keys())}.")
+    elif _auto_on and not _active:
+        st.info("🔄 Auto-optimización **activa**: por ahora usa los pesos base "
+                "(el optimizador todavía no encontró una mejora que pase las guardas).")
     else:
-        st.caption("Actualmente usando los **pesos base** (a ojo).")
+        st.warning("⏸️ Auto-optimización **pausada**. Usando pesos base fijos.")
+
+    _pause = st.checkbox("Pausar auto-optimización (fijar pesos base)", value=(not _auto_on))
+    if _pause != (not _auto_on):
+        try:
+            clients["storage"].save_json(
+                {"weights_by_bucket": (None if _pause else _active), "auto": (not _pause),
+                 "ts": datetime.now().timestamp()},
+                "config/forecast_weights.json")
+            st.rerun()
+        except Exception as e:
+            st.error(f"No se pudo guardar: {e}")
 
     bt = st.session_state.get("bt_auto")
     age = st.session_state.get("bt_age", 0.0)
     cga, cgb = st.columns([3, 1])
     with cga:
         if age is not None:
-            st.caption(f"Última medición: hace {age:.0f} h (se recalcula sola cada 24 h).")
+            st.caption(f"Última medición: hace {age:.0f} h (se recalcula y reajusta sola cada 24 h).")
     with cgb:
         if st.button("🔄 Recalcular ahora"):
             with st.spinner("Recorriendo meses cerrados..."):
-                _btr, _btage = get_backtest_cached(clients, months_back=12, force=True)
-            st.session_state["bt_auto"] = _btr
-            st.session_state["bt_age"]  = _btage
+                _btr, _btage, _bopt = get_backtest_cached(clients, months_back=12, force=True)
+            st.session_state["bt_auto"]  = _btr
+            st.session_state["bt_age"]   = _btage
+            st.session_state["opt_auto"] = _bopt
             st.rerun()
 
     if bt and "error" in bt:
@@ -473,53 +528,43 @@ if page == "🏠 Resumen":
             for col, k in zip(cc, sorted(mbc, key=int)):
                 col.metric(f"Día {k}", f"{mbc[k]}%")
 
-        # Optimizador: corre solo sobre las muestras cacheadas (rápido) y sugiere.
+        # Optimizador (informativo): muestra qué pesos aplica la auto-optimización.
         st.markdown("---")
-        st.markdown("**Pesos optimizados sugeridos** (buscados sobre tus datos):")
+        st.markdown("**Pesos que la auto-optimización aplica por fase** (buscados sobre tus datos):")
         samples = bt.get("_samples", [])
         opt = st.session_state.get("opt_auto")
-        if opt is None or st.session_state.get("opt_for") != bt.get("mape_global"):
-            with st.spinner("Buscando pesos que minimizan el error..."):
-                try:
-                    opt = clients["sales"].optimize_weights(samples)
-                except Exception as e:
-                    opt = {"error": str(e)}
-            st.session_state["opt_auto"] = opt
-            st.session_state["opt_for"]  = bt.get("mape_global")
+        if not opt or "error" in (opt or {}):
+            try:
+                opt = clients["sales"].optimize_weights(samples)
+                st.session_state["opt_auto"] = opt
+            except Exception as e:
+                opt = {"error": str(e)}
 
         if opt and "error" in opt:
             st.warning(f"No se pudo optimizar: {opt['error']}")
         elif opt and opt.get("weights_by_bucket"):
-            mejora = (opt.get("mape_global_base") or 0) - (opt.get("mape_global_opt") or 0)
-            st.markdown(f"Global: MAPE {opt['mape_global_base']}% → **{opt['mape_global_opt']}%** "
-                        f"({mejora:+.1f} pts con pesos optimizados).")
+            mejora_bucket = 0.0
+            for _b, _mp in opt.get("mape_by_bucket", {}).items():
+                if _mp.get("base") is not None and _mp.get("opt") is not None:
+                    mejora_bucket = max(mejora_bucket, _mp["base"] - _mp["opt"])
+            st.markdown(f"Global: MAPE {opt['mape_global_base']}% → **{opt['mape_global_opt']}%**.")
             fac = ["F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9"]
             rows = []
             for b in ["early", "mid", "late"]:
                 w  = opt["weights_by_bucket"].get(b)
                 mp = opt["mape_by_bucket"].get(b, {})
                 if w:
+                    aplica = "sí" if (mp.get("n", 0) >= 8 and (mp.get("base", 0) - mp.get("opt", 0)) >= 1.0
+                                      and abs(sum(w) - 1.0) <= 0.05 and max(w) <= 0.75) else "no (base)"
                     rows.append({"Fase": {"early": "Días 1-10", "mid": "Días 11-20", "late": "Días 21-fin"}[b],
                                  "MAPE base": f"{mp.get('base','?')}%", "MAPE opt": f"{mp.get('opt','?')}%",
-                                 "n": mp.get("n", 0),
+                                 "n": mp.get("n", 0), "aplica": aplica,
                                  **{fac[i]: f"{w[i]:.0%}" for i in range(9)}})
             if rows:
                 st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-            st.caption("Los pesos en 0% son factores redundantes. 'Días 21-fin' pesa poco "
-                       "porque ahí casi no queda mes por proyectar.")
-
-            if mejora >= 1.0:
-                if st.button("✅ Aplicar estos pesos (guardar en Dropbox)"):
-                    try:
-                        clients["storage"].save_json(
-                            {"weights_by_bucket": opt["weights_by_bucket"]},
-                            "config/forecast_weights.json")
-                        st.success("Pesos aplicados. El pronóstico ya los usa."); st.rerun()
-                    except Exception as e:
-                        st.error(f"No se pudo guardar: {e}")
-            else:
-                st.info("La mejora es chica (<1 pt): tus pesos actuales ya están bien parados. "
-                        "No hace falta aplicar nada.")
+            st.caption("Columna **aplica**: sólo se auto-aplican las fases que mejoran ≥1 pt, tienen "
+                       "≥8 muestras y pesos sanos. Las demás quedan en base. Los pesos en 0% son "
+                       "factores redundantes.")
 
 
 # ══════════════════════════════════════════════════════════════════
