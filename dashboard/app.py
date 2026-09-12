@@ -512,7 +512,8 @@ if page == "🏠 Resumen":
             if mejora_bucket >= 1.0:
                 st.caption(f"Mejora por fase de hasta **{mejora_bucket:.1f} pts** "
                            f"(el global sube poco porque el error de los primeros días manda).")
-                if st.button("✅ Aplicar estos pesos (guardar en Dropbox)"):
+                if st.button("🎯 Usar el pronóstico que erra menos",
+                             type="primary", use_container_width=True):
                     try:
                         clients["storage"].save_json(
                             {"weights_by_bucket": opt["weights_by_bucket"]},
