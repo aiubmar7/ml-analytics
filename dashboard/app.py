@@ -283,17 +283,19 @@ if page == "🏠 Resumen":
         with ac3:
             st.metric("Promedio diario (últ. 7d)", fmt_currency(forecast["daily_trend_revenue"]))
 
-        if forecast.get("baseline_revenue"):
-            a = forecast.get("blend_alpha", 0.0)
-            st.caption(
-                f"🧭 Pronóstico ajustado con blend por confianza: "
-                f"{a:.0%} extrapolación del mes + {1 - a:.0%} nivel base "
-                f"({fmt_currency(forecast['baseline_revenue'])}, prom. últ. 3 meses). "
-                f"Antes del blend daba {fmt_currency(forecast.get('ensemble_revenue', 0))}. "
-                f"A principio de mes se apoya más en el nivel base; sobre fin de mes, casi todo en la data real."
-            )
+        if forecast.get("reversion_lambda"):
+            lam = forecast["reversion_lambda"]
+            if lam > 0.001:
+                st.caption(
+                    f"🧭 **Factor 10 — Regresión a la media** aplicado: la proyección se "
+                    f"tiró un {lam:.0%} hacia la expectativa histórica con crecimiento "
+                    f"({fmt_currency(forecast.get('reversion_target', 0))}, promedio de F3/F8/F9). "
+                    f"Antes de F10 el ensemble daba {fmt_currency(forecast.get('ensemble_revenue', 0))}. "
+                    f"La corrección es más fuerte a principio de mes (cuando el arranque es menos "
+                    f"confiable) y se desvanece hacia fin de mes."
+                )
 
-        with st.expander("🔍 Detalle del cálculo (9 factores)"):
+        with st.expander("🔍 Detalle del cálculo (10 factores)"):
             d1, d2, d3 = st.columns(3)
             with d1:
                 st.metric("1️⃣ Promedio diario del mes", fmt_currency(forecast["proj_daily_avg"]), help="Peso: 10%")
@@ -331,6 +333,13 @@ if page == "🏠 Resumen":
             with d9:
                 yoy = forecast.get("proj_yoy_trend", 0)
                 st.metric("9️⃣ Tendencia interanual YoY", fmt_currency(yoy) if yoy else "Sin datos", help="Peso: 5%")
+            d10, _d11, _d12 = st.columns(3)
+            with d10:
+                lam = forecast.get("reversion_lambda", 0.0)
+                tgt = forecast.get("reversion_target", 0)
+                st.metric("🔟 Regresión a la media", fmt_currency(tgt) if tgt else "—",
+                          delta=f"🧭 tira {lam:.0%} hacia la media", delta_color="off",
+                          help="Ancla histórica con crecimiento (prom. F3/F8/F9). Corrige el arranque atípico; más fuerte a principio de mes.")
             if forecast.get("vs_last_year_pct") is not None:
                 st.info(f"📊 Crecimiento vs mismo mes del año anterior: **{forecast['vs_last_year_pct']:+.1f}%**")
 
@@ -735,8 +744,19 @@ elif page == "🗄️ Historial":
                     df = clients["sales"].get_orders_by_daterange(mes_inicio, mes_fin)
                     if df is not None and not df.empty:
                         path = f"data/historical/{mes_inicio.strftime('%Y-%m')}.parquet"
-                        clients["storage"].save_dataframe(df, path)
-                        results.append({"Mes": label, "Órdenes": len(df), "Estado": "OK"})
+                        # GUARDARRAÍL: no pisar un mes existente con una descarga
+                        # más chica (señal de datos parciales / órdenes archivadas).
+                        existente = None
+                        try:
+                            existente = clients["storage"].load_dataframe(path)
+                        except Exception:
+                            existente = None
+                        if existente is not None and not existente.empty and len(existente) > len(df):
+                            results.append({"Mes": label, "Órdenes": len(df),
+                                            "Estado": f"⛔ Protegido (guardado tiene {len(existente)}, la API trajo {len(df)})"})
+                        else:
+                            clients["storage"].save_dataframe(df, path)
+                            results.append({"Mes": label, "Órdenes": len(df), "Estado": "OK"})
                     else:
                         results.append({"Mes": label, "Órdenes": 0, "Estado": "Sin datos"})
                 except Exception as e:
