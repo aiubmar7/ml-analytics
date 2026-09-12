@@ -334,30 +334,35 @@ class MySalesExtractor:
                         return float(dfh[dfh["status"] == "paid"]["total_amount"].sum())
                     return 0.0
 
-                # Camina hacia atrás y junta hasta 3 meses COMPLETOS que
-                # existan en AMBOS años. Robusto al hueco de meses no
-                # snapshoteados: si faltan jun–ago 2026, sigue hacia atrás
-                # (abr, mar, feb…) hasta completar 3 pares. Sigue siendo un
-                # ancla estable, sólo que apoyada en meses algo más viejos.
-                num_cur = den_prev = 0.0
-                pairs = 0
+                # Junta meses COMPLETOS con dato en ambos años caminando hacia
+                # atrás, y BLINDA contra meses base anómalos: descarta un par si
+                # el mes del año pasado es demasiado chico respecto a los otros
+                # (p.ej. tu primer mes de ventas, abr-2025 con $259k), porque
+                # dispararía el YoY. Con los sobrevivientes usa los 3 más
+                # recientes. Robusto también al hueco de meses no snapshoteados.
+                cand = []  # (cur, prev) del más reciente al más viejo
                 mm, yy = today.month, today.year
-                for _ in range(8):
+                for _ in range(6):
                     mm -= 1
                     if mm == 0:
                         mm, yy = 12, yy - 1
                     cur    = _rev_curr(yy, mm)
                     prevyr = _rev_hist(yy - 1, mm)
                     if cur > 0 and prevyr > 0:
-                        num_cur  += cur
-                        den_prev += prevyr
-                        pairs    += 1
-                        if pairs >= 3:
-                            break
+                        cand.append((cur, prevyr))
 
-                if num_cur > 0 and den_prev > 0:
-                    growth = num_cur / den_prev              # YoY estable multi-mes
-                else:
+                growth = None
+                if cand:
+                    prevs = sorted(p for _, p in cand)
+                    med   = prevs[len(prevs) // 2]                 # mediana de las bases
+                    filtrados = [(c, p) for (c, p) in cand if p >= 0.30 * med]
+                    usar = (filtrados or cand)[:3]                 # 3 más recientes válidos
+                    num_cur  = sum(c for c, _ in usar)
+                    den_prev = sum(p for _, p in usar)
+                    if den_prev > 0:
+                        growth = num_cur / den_prev                # YoY estable multi-mes
+
+                if growth is None:                                 # fallback: YoY del tramo (= F9)
                     ly_dim    = calendar.monthrange(today.year - 1, today.month)[1]
                     ly_cutoff = date(today.year - 1, today.month, min(days_elapsed, ly_dim))
                     ly_period = float(df_ly_paid[df_ly_paid["date"] <= ly_cutoff]["total_amount"].sum())
@@ -571,8 +576,10 @@ class MySalesExtractor:
                 rev_ly_full   = float(df_ly_same["total_amount"].sum()) if not df_ly_same.empty else 0
 
                 if rev_ly_period > 0 and rev_ly_full > 0 and revenue_so_far > 0:
-                    # Tasa de crecimiento YoY en los mismos días
-                    yoy_rate_real = revenue_so_far / rev_ly_period
+                    # Tasa de crecimiento YoY en los mismos días, TOPEADA 0.5x–3x.
+                    # Sin tope, un archivo del año pasado incompleto (base chica)
+                    # dispara la proyección a valores absurdos (p.ej. $47M).
+                    yoy_rate_real = max(0.5, min(3.0, revenue_so_far / rev_ly_period))
                     # Proyectar el mes completo: total año anterior * tasa real
                     proj9_revenue = rev_ly_full * yoy_rate_real
                     proj9_units   = proj1_units * (proj9_revenue / proj1_revenue) if proj1_revenue > 0 else proj1_units
@@ -590,54 +597,30 @@ class MySalesExtractor:
         forecast_units   = (proj1_units   * w1) + (proj2_units   * w2) + (proj3_units   * w3) + (proj4_units   * w4) + (proj5_units   * w5) + (proj6_units   * w6) + (proj7_units   * w7) + (proj8_units   * w8) + (proj9_units   * w9)
         forecast_orders  = (proj1_orders  * w1) + (proj2_orders  * w2) + (proj3_orders  * w3) + (proj4_orders  * w4) + (proj5_orders  * w5) + (proj6_orders  * w6) + (proj7_orders  * w7) + (proj8_orders  * w8) + (proj9_orders  * w9)
 
-        ensemble_revenue = forecast_revenue  # guardar la versión pre-blend
+        ensemble_revenue = forecast_revenue   # versión pre-F10
+        ensemble_units   = forecast_units
+        ensemble_orders  = forecast_orders
 
-        # ── Blend por confianza (shrinkage hacia el nivel base) ───
-        # A principio de mes el ensemble extrapola pocos días y es
-        # inestable (el backtest lo confirma: ~24% de error a día 5).
-        # Lo mezclamos con el nivel base reciente (promedio ponderado de
-        # los últimos 3 meses completos), con peso α que crece con los
-        # días transcurridos: temprano confía en el base, tarde en la
-        # extrapolación. α = días_transcurridos / días_del_mes.
-        # IMPORTANTE: el nivel base sale del MISMO pull de 120 días del
-        # Factor 6, así que NO agrega llamadas a la API (no enlentece la
-        # carga de la página).
-        baseline_revenue = baseline_units = baseline_orders = None
-        if df_recent is not None and not df_recent.empty:
-            try:
-                b_rev, b_un, b_or = [], [], []
-                by, bm = today.year, today.month
-                for _ in range(3):              # 3 meses previos (nuevo -> viejo)
-                    bm -= 1
-                    if bm == 0:
-                        bm, by = 12, by - 1
-                    bdim = calendar.monthrange(by, bm)[1]
-                    mask = ((df_recent["date"] >= date(by, bm, 1)) &
-                            (df_recent["date"] <= date(by, bm, bdim)))
-                    dfb = df_recent[mask]
-                    tot = float(dfb["total_amount"].sum())
-                    if tot > 0:
-                        b_rev.append(tot)
-                        b_un.append(int(dfb["quantity"].sum()))
-                        b_or.append(dfb["order_id"].nunique())
-                if b_rev:
-                    # pesos por recencia: el mes más reciente pesa más (3,2,1)
-                    ws = list(range(len(b_rev), 0, -1))
-                    sw = float(sum(ws))
-                    baseline_revenue = sum(w * v for w, v in zip(ws, b_rev)) / sw
-                    baseline_units   = sum(w * v for w, v in zip(ws, b_un))  / sw
-                    baseline_orders  = sum(w * v for w, v in zip(ws, b_or))  / sw
-            except Exception:
-                pass
-
-        # Blend DESACTIVADO. El backtest mostró que mezclar hacia el nivel
-        # base (promedio de 3 meses) empeoraba el pronóstico en TODOS los
-        # cortes (global 15.7% -> 20.1%): el negocio viene en crecimiento y
-        # el promedio histórico queda corto, así que tirar hacia él baja la
-        # proyección de más. Se usa el ensemble puro de 6 factores, que el
-        # propio backtest muestra como el más certero.
-        blend_alpha = 1.0
-        baseline_revenue = baseline_units = baseline_orders = None
+        # ── Factor 10: Regresión a la media ───────────────────────────
+        # A principio de mes el ensemble extrapola pocos días y un arranque
+        # atípico (caliente o frío) lo desvía. F10 lo corrige tirándolo hacia
+        # la expectativa histórica CON crecimiento: el promedio de los factores
+        # "backward" (F3 ancla estable, F8 mes anterior, F9 YoY), que ya traen
+        # el crecimiento adentro. OJO: NO hacia un promedio plano de meses —
+        # eso ya se probó (blend viejo) y empeoraba, porque el negocio crece y
+        # el promedio histórico queda corto. El peso de corrección λ es mayor a
+        # principio de mes (cuando el arranque es menos confiable) y se
+        # desvanece hacia fin de mes, cuando el acumulado real ya manda:
+        #   λ = (1 - transcurrido/mes) * FUERZA,  topeado en F10_MAX.
+        F10_FUERZA = 0.50   # intensidad de la reversión (0 = apagado, subí para moderar más)
+        F10_MAX    = 0.50   # tope de λ
+        rev_target = (proj3_revenue + proj8_revenue + proj9_revenue) / 3.0
+        un_target  = (proj3_units   + proj8_units   + proj9_units)   / 3.0
+        or_target  = (proj3_orders  + proj8_orders  + proj9_orders)  / 3.0
+        lam = max(0.0, min(F10_MAX, (1.0 - days_elapsed / days_in_month) * F10_FUERZA))
+        forecast_revenue = ensemble_revenue * (1 - lam) + rev_target * lam
+        forecast_units   = ensemble_units   * (1 - lam) + un_target  * lam
+        forecast_orders  = ensemble_orders  * (1 - lam) + or_target  * lam
 
         # ── Comparaciones ─────────────────────────────────────────
         vs_prev_pct = None
@@ -679,8 +662,8 @@ class MySalesExtractor:
             "calendar_shape_pct":  round((weight_remaining / days_remaining - 1) * 100, 1) if days_remaining > 0 else 0.0,
             "seasonal_years":      len(seasonal_revenues),
             "ensemble_revenue":    round(ensemble_revenue, 2),
-            "baseline_revenue":    round(baseline_revenue, 2) if baseline_revenue else None,
-            "blend_alpha":         round(blend_alpha, 2),
+            "reversion_target":    round(rev_target, 2),
+            "reversion_lambda":    round(lam, 3),
             "daily_avg_revenue":   round(daily_avg_revenue, 2),
             "daily_trend_revenue": round(daily_trend_revenue, 2),
         }
