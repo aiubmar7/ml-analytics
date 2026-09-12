@@ -247,7 +247,17 @@ if page == "🏠 Resumen":
 
     with st.spinner("Calculando pronóstico..."):
         try:
-            forecast = clients["sales"].get_monthly_forecast()
+            # Pesos optimizados (si se guardaron desde el backtest). Si no hay,
+            # weights_by_bucket queda None y el pronóstico usa los pesos base.
+            _wbb = None
+            try:
+                _cfg = clients["storage"].load_json("config/forecast_weights.json")
+                if _cfg and _cfg.get("weights_by_bucket"):
+                    _wbb = _cfg["weights_by_bucket"]
+            except Exception:
+                _wbb = None
+            forecast = clients["sales"].get_monthly_forecast(weights_by_bucket=_wbb)
+            forecast["_weights_custom"] = bool(_wbb)
         except Exception as e:
             forecast = {"error": str(e)}
 
@@ -272,6 +282,24 @@ if page == "🏠 Resumen":
             st.metric("🛒 Órdenes proyectadas", f"{int(forecast['forecast_orders']):,}")
         with fc4:
             st.metric("💵 Neto proyectado", fmt_currency(forecast["forecast_net"]))
+
+        # ── B: rango medido a partir del error del backtest ───────────
+        # Usa el MAPE del día de corte más cercano (si el backtest ya se corrió
+        # en esta sesión). Si no, muestra una nota para correrlo.
+        _bt = st.session_state.get("bt_result")
+        _rev = forecast["forecast_revenue"]
+        if _bt and _bt.get("mape_by_cutoff") and _rev > 0:
+            _cuts = _bt["mape_by_cutoff"]
+            _near = min(_cuts.keys(), key=lambda c: abs(int(c) - forecast["days_elapsed"]))
+            _mape = _cuts[_near]
+            _lo, _hi = _rev * (1 - _mape / 100), _rev * (1 + _mape / 100)
+            st.info(
+                f"📏 **Rango probable:** {fmt_currency(_lo)} — {fmt_currency(_hi)}  "
+                f"(±{_mape}%, error típico del backtest a día ~{_near}). "
+                f"El rango se angosta a medida que avanza el mes."
+            )
+        else:
+            st.caption("📏 Corré el backtest (más abajo) para ver el rango de error medido de esta proyección.")
 
         st.markdown("#### Acumulado real vs proyección")
         ac1, ac2, ac3 = st.columns(3)
@@ -343,72 +371,97 @@ if page == "🏠 Resumen":
             if forecast.get("vs_last_year_pct") is not None:
                 st.info(f"📊 Crecimiento vs mismo mes del año anterior: **{forecast['vs_last_year_pct']:+.1f}%**")
 
-    # ── Backtest del pronóstico (recalibración de pesos) ──────────
+    # ── Backtest real + optimización de pesos (A/B/C/D) ───────────
     st.markdown("---")
-    st.subheader("🎯 Backtest del pronóstico (MAPE)")
-    st.caption("Re-corre la proyección como si fuera el día X de meses pasados y mide el error % real de cada factor. Sirve para recalibrar los pesos con datos en vez de a ojo.")
+    st.subheader("🎯 Backtest del pronóstico (MAPE real)")
+    st.caption("Re-corre la MISMA función de producción (10 factores) como si fuera el día X "
+               "de meses ya cerrados, y mide el error % contra el total real. Con eso se puede "
+               "optimizar los pesos con datos en vez de a ojo, y por fase del mes.")
 
-    bt_col1, _bt_col2 = st.columns([1, 2])
-    with bt_col1:
-        bt_months = st.selectbox("Meses a testear", [3, 4, 6], index=2)
-    run_bt = st.button("▶️ Correr backtest (tarda ~30-60s)")
-
-    if run_bt:
-        with st.spinner("Bajando meses anteriores y replayando proyecciones..."):
+    # Estado de pesos activos
+    _active = None
+    try:
+        _c = clients["storage"].load_json("config/forecast_weights.json")
+        if _c and _c.get("weights_by_bucket"):
+            _active = _c["weights_by_bucket"]
+    except Exception:
+        _active = None
+    if _active:
+        st.success("✅ Pronóstico usando **pesos optimizados** (por fase del mes). "
+                   f"Buckets guardados: {', '.join(_active.keys())}.")
+        if st.button("↩️ Volver a los pesos base"):
             try:
-                bt = clients["sales"].backtest_forecast(months_back=bt_months, cutoffs=(5, 10, 15, 20))
+                clients["storage"].save_json({"weights_by_bucket": None}, "config/forecast_weights.json")
+                st.session_state.pop("opt_result", None)
+                st.success("Restaurados los pesos base."); st.rerun()
+            except Exception as e:
+                st.error(f"No se pudo restaurar: {e}")
+    else:
+        st.caption("Actualmente usando los **pesos base** (a ojo). Corré el backtest y optimizá para mejorarlos.")
+
+    bt_months = st.selectbox("Meses a testear", [6, 12, 18], index=1)
+    if st.button("▶️ Correr backtest (tarda ~30-90s)"):
+        with st.spinner("Replayando proyecciones sobre meses cerrados..."):
+            try:
+                bt = clients["sales"].backtest_forecast(months_back=bt_months, cutoffs=(5, 10, 15, 20, 25))
             except Exception as e:
                 bt = {"error": str(e)}
+        st.session_state["bt_result"] = bt
+        st.session_state.pop("opt_result", None)
 
-        if "error" in bt:
-            st.warning(f"No se pudo correr el backtest: {bt['error']}")
-        elif bt.get("samples", 0) == 0:
-            st.warning("No hay meses cerrados con datos suficientes en la ventana de la API.")
-        else:
-            st.caption(f"Basado en {bt['samples']} muestras · {bt['months_tested']} meses · cortes en días {bt['cutoffs']}")
-            f = bt["factor_mape"]
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("1️⃣ Promedio diario", f"{f['proj1']:.1f}%", help="Error medio del factor por sí solo")
-            c2.metric("2️⃣ Tendencia 7d", f"{f['proj2']:.1f}%")
-            c3.metric("5️⃣ Velocidad", f"{f['proj5']:.1f}%")
-            c4.metric("6️⃣ Forma intra-mes", f"{f['proj6']:.1f}%")
+    bt = st.session_state.get("bt_result")
+    if bt and "error" in bt:
+        st.warning(f"No se pudo correr el backtest: {bt['error']}")
+    elif bt and bt.get("samples", 0) == 0:
+        st.warning("No hay meses cerrados con datos suficientes en Dropbox para backtestear.")
+    elif bt:
+        st.markdown(f"**Error global (MAPE): {bt['mape_global']}%**  "
+                    f"· {bt['samples']} muestras · {bt['months_tested']} meses")
+        mbc = bt.get("mape_by_cutoff", {})
+        if mbc:
+            st.markdown("**Error por día de corte** (así se angosta el pronóstico al avanzar el mes):")
+            cc = st.columns(len(mbc))
+            for col, k in zip(cc, sorted(mbc, key=int)):
+                col.metric(f"Día {k}", f"{mbc[k]}%")
 
-            e1, e2 = st.columns(2)
-            e1.metric("Ensemble actual", f"{bt['ensemble_mape_current']:.1f}%")
-            mejora = bt["ensemble_mape_optimized"] - bt["ensemble_mape_current"]
-            e2.metric("Ensemble óptimo", f"{bt['ensemble_mape_optimized']:.1f}%",
-                      delta=f"{mejora:+.1f} pts", delta_color="inverse")
+        st.markdown("---")
+        if st.button("🔧 Optimizar pesos con estos datos"):
+            with st.spinner("Buscando pesos que minimizan el error..."):
+                try:
+                    st.session_state["opt_result"] = clients["sales"].optimize_weights(bt.get("_samples", []))
+                except Exception as e:
+                    st.session_state["opt_result"] = {"error": str(e)}
 
-            mbc  = bt.get("mape_by_cutoff", {})
-            mbcb = bt.get("mape_by_cutoff_blend", {})
-            if mbc:
-                st.markdown("**Error por día del mes — sin blend vs con blend:**")
-                cc = st.columns(len(mbc))
-                for col, k in zip(cc, sorted(mbc)):
-                    cur = mbc[k]
-                    bl  = mbcb.get(k)
-                    if bl is not None:
-                        col.metric(f"Día {k}", f"{bl:.1f}%",
-                                   delta=f"{bl - cur:+.1f} vs sin blend", delta_color="inverse")
-                    else:
-                        col.metric(f"Día {k}", f"{cur:.1f}%")
-                eb = bt.get("ensemble_mape_blend")
-                if eb is not None:
-                    st.caption(
-                        f"Global: sin blend {bt['ensemble_mape_current']:.1f}% → con blend {eb:.1f}%. "
-                        "El blend ataca sobre todo los días tempranos (5-10), que es donde el pronóstico erraba más."
-                    )
+        opt = st.session_state.get("opt_result")
+        if opt and "error" in opt:
+            st.warning(f"No se pudo optimizar: {opt['error']}")
+        elif opt and opt.get("weights_by_bucket"):
+            st.markdown(f"**Global:** MAPE {opt['mape_global_base']}% → **{opt['mape_global_opt']}%** "
+                        f"con pesos optimizados.")
+            fac = ["F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9"]
+            rows = []
+            for b in ["early", "mid", "late"]:
+                w = opt["weights_by_bucket"].get(b)
+                mp = opt["mape_by_bucket"].get(b, {})
+                if w:
+                    rows.append({"Fase": {"early": "Días 1-10", "mid": "Días 11-20", "late": "Días 21-fin"}[b],
+                                 "MAPE base": f"{mp.get('base','?')}%", "MAPE opt": f"{mp.get('opt','?')}%",
+                                 "muestras": mp.get("n", 0),
+                                 **{fac[i]: f"{w[i]:.0%}" for i in range(9)}})
+            if rows:
+                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+            st.caption("Los pesos que quedan en 0% son factores redundantes (miden lo mismo que otros). "
+                       "'Días 21-fin' importa poco porque ahí ya casi no queda mes por proyectar.")
 
-            ow = bt["optimized_weights"]
-            st.success(
-                "**Pesos óptimos sugeridos** (sobre los 4 factores extrapolables):  "
-                f"P1 {ow['proj1']:.0%} · P2 {ow['proj2']:.0%} · P5 {ow['proj5']:.0%} · P6 {ow['proj6']:.0%}"
-            )
-            st.caption(
-                "Los factores 3 (año anterior) y 4 (estacionalidad) no se backtestean: no hay histórico en Dropbox, "
-                "hoy colapsan al factor 1. Para aplicarlos, en get_monthly_forecast poné w2/w5/w6 con estos valores y "
-                "repartí el peso de P1 entre w1 (y w3/w4 cuando cargues histórico)."
-            )
+            if st.button("✅ Aplicar estos pesos (guardar en Dropbox)"):
+                try:
+                    clients["storage"].save_json(
+                        {"weights_by_bucket": opt["weights_by_bucket"]},
+                        "config/forecast_weights.json")
+                    st.success("Pesos aplicados. El pronóstico ya los usa. (Recargá para verlo.)")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"No se pudo guardar: {e}")
 
 
 # ══════════════════════════════════════════════════════════════════
