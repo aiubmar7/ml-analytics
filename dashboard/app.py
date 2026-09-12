@@ -96,6 +96,35 @@ def auto_capture_historial(clients, lookback_months=5):
     return capturados
 
 
+def get_backtest_cached(clients, months_back=12, max_age_h=24, force=False):
+    """Backtest automático con cache en Dropbox: lo corre solo si no hay
+    resultado guardado o si el guardado tiene más de max_age_h horas. Así no
+    se re-ejecuta (60s) en cada interacción ni se pierde al recargar. Devuelve
+    (result, edad_horas). result incluye 'samples' para el optimizador."""
+    path = "config/backtest_cache.json"
+    if not force:
+        try:
+            cached = clients["storage"].load_json(path)
+            if cached and cached.get("ts") and cached.get("months_back") == months_back:
+                age = (datetime.now().timestamp() - cached["ts"]) / 3600.0
+                if age < max_age_h:
+                    return cached.get("result", {}), age
+        except Exception:
+            pass
+    # correr fresco
+    try:
+        res = clients["sales"].backtest_forecast(months_back=months_back, cutoffs=(5, 10, 15, 20, 25))
+    except Exception as e:
+        return {"error": str(e)}, 0.0
+    # guardar (los samples son chicos: ~60 x 9 floats)
+    try:
+        clients["storage"].save_json(
+            {"ts": datetime.now().timestamp(), "months_back": months_back, "result": res}, path)
+    except Exception:
+        pass
+    return res, 0.0
+
+
 # Captura automática (1 vez por sesión): descarga los meses cerrados que
 # falten. En sesiones donde no falta nada, es solo un listado de Dropbox.
 if "auto_snap" not in st.session_state:
@@ -261,6 +290,15 @@ if page == "🏠 Resumen":
         except Exception as e:
             forecast = {"error": str(e)}
 
+    # Backtest automático (cacheado en Dropbox, se recalcula 1 vez/día).
+    # Lo usan el rango (📏) y el panel de más abajo. Sin botón.
+    if "bt_auto" not in st.session_state:
+        with st.spinner("Midiendo el error del pronóstico (backtest)..."):
+            _btr, _btage = get_backtest_cached(clients, months_back=12)
+        st.session_state["bt_auto"] = _btr
+        st.session_state["bt_age"]  = _btage
+    bt = st.session_state.get("bt_auto")
+
     if "error" in forecast:
         st.warning(f"No se pudo calcular el pronóstico: {forecast['error']}")
     else:
@@ -284,22 +322,32 @@ if page == "🏠 Resumen":
             st.metric("💵 Neto proyectado", fmt_currency(forecast["forecast_net"]))
 
         # ── B: rango medido a partir del error del backtest ───────────
-        # Usa el MAPE del día de corte más cercano (si el backtest ya se corrió
-        # en esta sesión). Si no, muestra una nota para correrlo.
-        _bt = st.session_state.get("bt_result")
+        # Interpola el MAPE entre los dos cortes que rodean el día actual
+        # (en vez de agarrar el más cercano), para que el rango sea preciso.
+        _bt = st.session_state.get("bt_auto")
         _rev = forecast["forecast_revenue"]
         if _bt and _bt.get("mape_by_cutoff") and _rev > 0:
-            _cuts = _bt["mape_by_cutoff"]
-            _near = min(_cuts.keys(), key=lambda c: abs(int(c) - forecast["days_elapsed"]))
-            _mape = _cuts[_near]
+            _cuts = sorted(((int(k), v) for k, v in _bt["mape_by_cutoff"].items()), key=lambda x: x[0])
+            _d = forecast["days_elapsed"]
+            if _d <= _cuts[0][0]:
+                _mape = _cuts[0][1]
+            elif _d >= _cuts[-1][0]:
+                _mape = _cuts[-1][1]
+            else:
+                _mape = _cuts[-1][1]
+                for (k0, v0), (k1, v1) in zip(_cuts, _cuts[1:]):
+                    if k0 <= _d <= k1:
+                        _mape = v0 + (v1 - v0) * (_d - k0) / (k1 - k0)
+                        break
+            _mape = round(_mape, 1)
             _lo, _hi = _rev * (1 - _mape / 100), _rev * (1 + _mape / 100)
             st.info(
                 f"📏 **Rango probable:** {fmt_currency(_lo)} — {fmt_currency(_hi)}  "
-                f"(±{_mape}%, error típico del backtest a día ~{_near}). "
+                f"(±{_mape}%, error típico del backtest para el día {_d}). "
                 f"El rango se angosta a medida que avanza el mes."
             )
         else:
-            st.caption("📏 Corré el backtest (más abajo) para ver el rango de error medido de esta proyección.")
+            st.caption("📏 El backtest todavía no tiene datos suficientes para estimar el rango.")
 
         st.markdown("#### Acumulado real vs proyección")
         ac1, ac2, ac3 = st.columns(3)
@@ -371,12 +419,11 @@ if page == "🏠 Resumen":
             if forecast.get("vs_last_year_pct") is not None:
                 st.info(f"📊 Crecimiento vs mismo mes del año anterior: **{forecast['vs_last_year_pct']:+.1f}%**")
 
-    # ── Backtest real + optimización de pesos (A/B/C/D) ───────────
+    # ── Backtest AUTOMÁTICO + optimización de pesos (A/B/C/D) ──────
     st.markdown("---")
     st.subheader("🎯 Backtest del pronóstico (MAPE real)")
-    st.caption("Re-corre la MISMA función de producción (10 factores) como si fuera el día X "
-               "de meses ya cerrados, y mide el error % contra el total real. Con eso se puede "
-               "optimizar los pesos con datos en vez de a ojo, y por fase del mes.")
+    st.caption("Corre solo (una vez por día) re-ejecutando la MISMA función de producción "
+               "sobre los meses cerrados y midiendo el error % contra el total real. Sin botón.")
 
     # Estado de pesos activos
     _active = None
@@ -392,29 +439,31 @@ if page == "🏠 Resumen":
         if st.button("↩️ Volver a los pesos base"):
             try:
                 clients["storage"].save_json({"weights_by_bucket": None}, "config/forecast_weights.json")
-                st.session_state.pop("opt_result", None)
                 st.success("Restaurados los pesos base."); st.rerun()
             except Exception as e:
                 st.error(f"No se pudo restaurar: {e}")
     else:
-        st.caption("Actualmente usando los **pesos base** (a ojo). Corré el backtest y optimizá para mejorarlos.")
+        st.caption("Actualmente usando los **pesos base** (a ojo).")
 
-    bt_months = st.selectbox("Meses a testear", [6, 12, 18], index=1)
-    if st.button("▶️ Correr backtest (tarda ~30-90s)"):
-        with st.spinner("Replayando proyecciones sobre meses cerrados..."):
-            try:
-                bt = clients["sales"].backtest_forecast(months_back=bt_months, cutoffs=(5, 10, 15, 20, 25))
-            except Exception as e:
-                bt = {"error": str(e)}
-        st.session_state["bt_result"] = bt
-        st.session_state.pop("opt_result", None)
+    bt = st.session_state.get("bt_auto")
+    age = st.session_state.get("bt_age", 0.0)
+    cga, cgb = st.columns([3, 1])
+    with cga:
+        if age is not None:
+            st.caption(f"Última medición: hace {age:.0f} h (se recalcula sola cada 24 h).")
+    with cgb:
+        if st.button("🔄 Recalcular ahora"):
+            with st.spinner("Recorriendo meses cerrados..."):
+                _btr, _btage = get_backtest_cached(clients, months_back=12, force=True)
+            st.session_state["bt_auto"] = _btr
+            st.session_state["bt_age"]  = _btage
+            st.rerun()
 
-    bt = st.session_state.get("bt_result")
     if bt and "error" in bt:
         st.warning(f"No se pudo correr el backtest: {bt['error']}")
-    elif bt and bt.get("samples", 0) == 0:
+    elif not bt or bt.get("samples", 0) == 0:
         st.warning("No hay meses cerrados con datos suficientes en Dropbox para backtestear.")
-    elif bt:
+    else:
         st.markdown(f"**Error global (MAPE): {bt['mape_global']}%**  "
                     f"· {bt['samples']} muestras · {bt['months_tested']} meses")
         mbc = bt.get("mape_by_cutoff", {})
@@ -424,44 +473,53 @@ if page == "🏠 Resumen":
             for col, k in zip(cc, sorted(mbc, key=int)):
                 col.metric(f"Día {k}", f"{mbc[k]}%")
 
+        # Optimizador: corre solo sobre las muestras cacheadas (rápido) y sugiere.
         st.markdown("---")
-        if st.button("🔧 Optimizar pesos con estos datos"):
+        st.markdown("**Pesos optimizados sugeridos** (buscados sobre tus datos):")
+        samples = bt.get("_samples", [])
+        opt = st.session_state.get("opt_auto")
+        if opt is None or st.session_state.get("opt_for") != bt.get("mape_global"):
             with st.spinner("Buscando pesos que minimizan el error..."):
                 try:
-                    st.session_state["opt_result"] = clients["sales"].optimize_weights(bt.get("_samples", []))
+                    opt = clients["sales"].optimize_weights(samples)
                 except Exception as e:
-                    st.session_state["opt_result"] = {"error": str(e)}
+                    opt = {"error": str(e)}
+            st.session_state["opt_auto"] = opt
+            st.session_state["opt_for"]  = bt.get("mape_global")
 
-        opt = st.session_state.get("opt_result")
         if opt and "error" in opt:
             st.warning(f"No se pudo optimizar: {opt['error']}")
         elif opt and opt.get("weights_by_bucket"):
-            st.markdown(f"**Global:** MAPE {opt['mape_global_base']}% → **{opt['mape_global_opt']}%** "
-                        f"con pesos optimizados.")
+            mejora = (opt.get("mape_global_base") or 0) - (opt.get("mape_global_opt") or 0)
+            st.markdown(f"Global: MAPE {opt['mape_global_base']}% → **{opt['mape_global_opt']}%** "
+                        f"({mejora:+.1f} pts con pesos optimizados).")
             fac = ["F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9"]
             rows = []
             for b in ["early", "mid", "late"]:
-                w = opt["weights_by_bucket"].get(b)
+                w  = opt["weights_by_bucket"].get(b)
                 mp = opt["mape_by_bucket"].get(b, {})
                 if w:
                     rows.append({"Fase": {"early": "Días 1-10", "mid": "Días 11-20", "late": "Días 21-fin"}[b],
                                  "MAPE base": f"{mp.get('base','?')}%", "MAPE opt": f"{mp.get('opt','?')}%",
-                                 "muestras": mp.get("n", 0),
+                                 "n": mp.get("n", 0),
                                  **{fac[i]: f"{w[i]:.0%}" for i in range(9)}})
             if rows:
                 st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-            st.caption("Los pesos que quedan en 0% son factores redundantes (miden lo mismo que otros). "
-                       "'Días 21-fin' importa poco porque ahí ya casi no queda mes por proyectar.")
+            st.caption("Los pesos en 0% son factores redundantes. 'Días 21-fin' pesa poco "
+                       "porque ahí casi no queda mes por proyectar.")
 
-            if st.button("✅ Aplicar estos pesos (guardar en Dropbox)"):
-                try:
-                    clients["storage"].save_json(
-                        {"weights_by_bucket": opt["weights_by_bucket"]},
-                        "config/forecast_weights.json")
-                    st.success("Pesos aplicados. El pronóstico ya los usa. (Recargá para verlo.)")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"No se pudo guardar: {e}")
+            if mejora >= 1.0:
+                if st.button("✅ Aplicar estos pesos (guardar en Dropbox)"):
+                    try:
+                        clients["storage"].save_json(
+                            {"weights_by_bucket": opt["weights_by_bucket"]},
+                            "config/forecast_weights.json")
+                        st.success("Pesos aplicados. El pronóstico ya los usa."); st.rerun()
+                    except Exception as e:
+                        st.error(f"No se pudo guardar: {e}")
+            else:
+                st.info("La mejora es chica (<1 pt): tus pesos actuales ya están bien parados. "
+                        "No hace falta aplicar nada.")
 
 
 # ══════════════════════════════════════════════════════════════════
