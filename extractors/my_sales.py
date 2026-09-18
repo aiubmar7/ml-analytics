@@ -225,8 +225,10 @@ class MySalesExtractor:
             path = f"data/historical/{year:04d}-{month:02d}.parquet"
             df = self.storage.load_dataframe(path)
             if df is not None and not df.empty:
-                df["date_created"] = pd.to_datetime(df["date_created"])
-                df["date"] = df["date_created"].dt.date
+                # utc=True normaliza cualquier mezcla de offsets (-03/-04) o
+                # fechas naive; la fecha del día se deriva en hora de Uruguay.
+                df["date_created"] = pd.to_datetime(df["date_created"], utc=True)
+                df["date"] = df["date_created"].dt.tz_convert(UY_TZ).dt.date
                 if "net_amount" not in df.columns:
                     df["net_amount"] = df["total_amount"] - df.get("sale_fee", 0)
             self._hist_cache[key] = df
@@ -252,7 +254,7 @@ class MySalesExtractor:
         if df_all is None or df_all.empty:
             return {"error": "Sin datos suficientes para proyectar"}
         df_all = df_all[df_all["status"] == "paid"].copy()
-        df_all["date"] = pd.to_datetime(df_all["date_created"]).dt.date
+        df_all["date"] = pd.to_datetime(df_all["date_created"], utc=True).dt.tz_convert(UY_TZ).dt.date
 
         df_paid = df_all[df_all["date"] >= date(today.year, today.month, 1)].copy()
         if df_paid.empty:
@@ -307,7 +309,7 @@ class MySalesExtractor:
             if df_ly is not None and not df_ly.empty:
                 df_ly_paid = df_ly[df_ly["status"] == "paid"].copy()
                 if "date" not in df_ly_paid.columns:
-                    df_ly_paid["date"] = pd.to_datetime(df_ly_paid["date_created"]).dt.date
+                    df_ly_paid["date"] = pd.to_datetime(df_ly_paid["date_created"], utc=True).dt.tz_convert(UY_TZ).dt.date
                 ly_revenue = float(df_ly_paid["total_amount"].sum())
         except Exception:
             pass
@@ -402,7 +404,7 @@ class MySalesExtractor:
                     continue
                 df_hist = df_hist[df_hist["status"] == "paid"].copy()
                 if "date" not in df_hist.columns:
-                    df_hist["date"] = pd.to_datetime(df_hist["date_created"]).dt.date
+                    df_hist["date"] = pd.to_datetime(df_hist["date_created"], utc=True).dt.tz_convert(UY_TZ).dt.date
                 hist_full = float(df_hist["total_amount"].sum())
                 if hist_full <= 0:
                     continue
@@ -542,7 +544,7 @@ class MySalesExtractor:
                 if df_hist_prev is not None and not df_hist_prev.empty:
                     df_hist_prev = df_hist_prev[df_hist_prev["status"] == "paid"].copy()
                     if "date" not in df_hist_prev.columns:
-                        df_hist_prev["date"] = pd.to_datetime(df_hist_prev["date_created"]).dt.date
+                        df_hist_prev["date"] = pd.to_datetime(df_hist_prev["date_created"], utc=True).dt.tz_convert(UY_TZ).dt.date
                     df_same_days_prev = df_hist_prev[
                         df_hist_prev["date"] <= date(prev_year_8, prev_month_8, min(days_elapsed, prev_days_8))
                     ]
@@ -576,7 +578,7 @@ class MySalesExtractor:
             if df_ly_same is not None and not df_ly_same.empty:
                 df_ly_same = df_ly_same[df_ly_same["status"] == "paid"].copy()
                 if "date" not in df_ly_same.columns:
-                    df_ly_same["date"] = pd.to_datetime(df_ly_same["date_created"]).dt.date
+                    df_ly_same["date"] = pd.to_datetime(df_ly_same["date_created"], utc=True).dt.tz_convert(UY_TZ).dt.date
                 # Solo los mismos días transcurridos del año anterior
                 df_ly_period = df_ly_same[
                     df_ly_same["date"] <= date(today.year - 1, today.month, min(days_elapsed, calendar.monthrange(today.year - 1, today.month)[1]))
@@ -720,7 +722,7 @@ class MySalesExtractor:
                 continue
             dfm_paid = dfm[dfm["status"] == "paid"].copy()
             if "date" not in dfm_paid.columns:
-                dfm_paid["date"] = pd.to_datetime(dfm_paid["date_created"]).dt.date
+                dfm_paid["date"] = pd.to_datetime(dfm_paid["date_created"], utc=True).dt.tz_convert(UY_TZ).dt.date
             actual = float(dfm_paid["total_amount"].sum())
             if actual <= 0:
                 continue
