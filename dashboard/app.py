@@ -120,7 +120,7 @@ def auto_capture_historial(clients, lookback_months=5):
     return capturados
 
 
-def get_backtest_cached(clients, months_back=20, max_age_h=24, force=False):
+def get_backtest_cached(clients, months_back=12, max_age_h=24, force=False):
     """Backtest automático con cache en Dropbox: lo corre solo si no hay
     resultado guardado o si el guardado tiene más de max_age_h horas. Así no
     se re-ejecuta (60s) en cada interacción ni se pierde al recargar.
@@ -317,7 +317,7 @@ if page == "🏠 Resumen":
     # Lo usan el rango (📏) y el panel de más abajo. Sin botón.
     if "bt_auto" not in st.session_state:
         with st.spinner("Midiendo el error del pronóstico (backtest)..."):
-            _btr, _btage = get_backtest_cached(clients, months_back=20)
+            _btr, _btage = get_backtest_cached(clients, months_back=12)
         st.session_state["bt_auto"] = _btr
         st.session_state["bt_age"]  = _btage
     bt = st.session_state.get("bt_auto")
@@ -477,7 +477,7 @@ if page == "🏠 Resumen":
     with cgb:
         if st.button("🔄 Recalcular ahora"):
             with st.spinner("Recorriendo meses cerrados..."):
-                _btr, _btage = get_backtest_cached(clients, months_back=20, force=True)
+                _btr, _btage = get_backtest_cached(clients, months_back=12, force=True)
             st.session_state["bt_auto"] = _btr
             st.session_state["bt_age"]  = _btage
             st.session_state.pop("opt_auto", None)
