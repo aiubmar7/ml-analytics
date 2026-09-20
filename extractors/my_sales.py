@@ -36,6 +36,23 @@ class MySalesExtractor:
         self._orders_cache = {}   # {days_back: (timestamp, df)} cache con TTL
         self._hist_cache   = {}   # {(year, month): df} cache de meses históricos
 
+    # Curva de liberación de Mercado Pago: fracción ACUMULADA del dinero neto
+    # liberado por día de atraso desde la venta. Medida sobre jun/jul/ago 2026.
+    # La cola (>15 días) son ventas que esperan confirmación de entrega o disputa.
+    _RELEASE_CURVE = [0.000, 0.018, 0.023, 0.203, 0.476, 0.627, 0.710, 0.742,
+                      0.759, 0.792, 0.834, 0.871, 0.895, 0.910, 0.924, 0.930]
+    COBRANZA_NET_RATE = 0.82   # tasa neta MP (neto/bruto); cambiá si varía
+
+    def _release_cum(self, k: int) -> float:
+        """Fracción del monto de una venta ya liberada k días después."""
+        if k < 0:
+            return 0.0
+        c = self._RELEASE_CURVE
+        if k < len(c):
+            return c[k]
+        # cola: de 0.93 (día 15) sube a 1.0 hacia el día 45
+        return min(1.0, c[-1] + (1.0 - c[-1]) * (k - (len(c) - 1)) / 30.0)
+
     def _get_user_id(self) -> str:
         if not self.user_id:
             me = self.client.get_my_user()
@@ -687,6 +704,63 @@ class MySalesExtractor:
             "reversion_lambda":    round(lam, 3),
             "daily_avg_revenue":   round(daily_avg_revenue, 2),
             "daily_trend_revenue": round(daily_trend_revenue, 2),
+        }
+
+    def get_cobranza_forecast(self, as_of=None) -> dict:
+        """Pronóstico de cobranza con TIMING real: aplica la curva de liberación
+        de MP a las ventas DIARIAS (reales las transcurridas, proyectadas las que
+        faltan) y cuenta solo lo que se libera DENTRO del mes. Suma lo que arrastra
+        del mes anterior (ventas de fin de mes previo que se liberan ahora) y resta
+        lo que se va al mes siguiente (ventas de fin de este mes)."""
+        today = as_of if as_of is not None else _today_uy()
+        dim = calendar.monthrange(today.year, today.month)[1]
+        de  = today.day
+        rem = dim - de
+        fc = self.get_monthly_forecast(as_of=as_of)
+        if not fc or "error" in fc:
+            return {"error": (fc or {}).get("error", "sin pronóstico")}
+        rev_month  = fc["forecast_revenue"]
+        rev_so_far = fc["revenue_so_far"]
+        rem_daily  = (rev_month - rev_so_far) / rem if rem > 0 else 0.0
+
+        df = self.get_orders(120)
+        if df is None or df.empty:
+            return {"error": "sin datos"}
+        df = df[df["status"] == "paid"].copy()
+        df["date"] = pd.to_datetime(df["date_created"], utc=True).dt.tz_convert(UY_TZ).dt.date
+        daily = df.groupby("date")["total_amount"].sum()
+
+        rate = self.COBRANZA_NET_RATE
+        month_start = date(today.year, today.month, 1)
+        month_end   = date(today.year, today.month, dim)
+
+        # Arrastre de meses previos: ventas anteriores cuyo dinero se libera DENTRO de este mes.
+        carry_in = 0.0
+        for d, s in daily.items():
+            if d >= month_start:
+                continue
+            frac_in = self._release_cum((month_end - d).days) - self._release_cum((month_start - d).days - 1)
+            if frac_in > 0:
+                carry_in += float(s) * rate * frac_in
+
+        # Ventas de este mes (reales las transcurridas, proyectadas las que faltan)
+        cob_mes = 0.0; spill_out = 0.0
+        for n in range(1, dim + 1):
+            d = date(today.year, today.month, n)
+            s = float(daily.get(d, 0.0)) if n <= de else rem_daily
+            frac_in = self._release_cum((month_end - d).days)
+            cob_mes   += s * rate * frac_in
+            spill_out += s * rate * (1.0 - frac_in)
+
+        total = cob_mes + carry_in
+        return {
+            "cobranza_mes":              round(total, 2),
+            "de_ventas_del_mes":         round(cob_mes, 2),
+            "carry_in_mes_anterior":     round(carry_in, 2),
+            "spill_al_mes_siguiente":    round(spill_out, 2),
+            "ventas_proyectadas":        round(rev_month, 2),
+            "naive_ventas_x_tasa":       round(rev_month * rate, 2),
+            "tasa":                      rate,
         }
 
     def backtest_forecast(self, months_back: int = 12, cutoffs=(5, 10, 15, 20, 25)) -> dict:
