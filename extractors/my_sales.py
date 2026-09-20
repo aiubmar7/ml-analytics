@@ -41,7 +41,7 @@ class MySalesExtractor:
     # La cola (>15 días) son ventas que esperan confirmación de entrega o disputa.
     _RELEASE_CURVE = [0.000, 0.018, 0.023, 0.203, 0.476, 0.627, 0.710, 0.742,
                       0.759, 0.792, 0.834, 0.871, 0.895, 0.910, 0.924, 0.930]
-    COBRANZA_NET_RATE = 0.82   # tasa neta MP (neto/bruto); cambiá si varía
+    COBRANZA_NET_RATE = 0.81   # tasa neta MP (promedio 5 meses abr-ago 2026: 81,3%)
 
     def _release_cum(self, k: int) -> float:
         """Fracción del monto de una venta ya liberada k días después."""
