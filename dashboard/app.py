@@ -382,19 +382,23 @@ if page == "🏠 Resumen":
             _cob = {"error": str(_e)}
         if _cob and "error" not in _cob:
             st.markdown("#### 💰 Cobranza proyectada (Mercado Pago)")
+            _entra = _cob["cobranza_mes"]   # arrastre + ventas del mes liberadas este mes
             cb1, cb2, cb3 = st.columns(3)
-            cb1.metric("Cobranza neta del mes", fmt_currency(_cob["cobranza_mes"]),
-                       help="Lo que realmente entra a tu cuenta MP este mes, con el timing "
-                            "de liberación real (no todas las ventas del mes se cobran en el mes).")
+            cb1.metric("Entra a tu cuenta este mes", fmt_currency(_entra),
+                       help="Lo que MP te libera DENTRO del mes: arrastre del mes anterior + "
+                            "ventas de este mes que se liberan antes de fin de mes. Ya excluye "
+                            "lo que se cobra recién el mes que viene.")
             cb2.metric("Ventas del mes (bruto)", fmt_currency(_cob["ventas_proyectadas"]))
             cb3.metric("Tasa neta MP", f"{_cob['tasa']:.0%}")
-            st.caption(
-                f"Desglose: de ventas de este mes **{fmt_currency(_cob['de_ventas_del_mes'])}** "
-                f"+ arrastre del mes anterior **{fmt_currency(_cob['carry_in_mes_anterior'])}**. "
-                f"Se corre al mes que viene **{fmt_currency(_cob['spill_al_mes_siguiente'])}** "
-                f"(ventas de fin de mes que MP libera después). "
-                f"El atajo ventas×tasa daría {fmt_currency(_cob['naive_ventas_x_tasa'])}; el timing real "
-                f"lo ajusta según la curva de liberación medida de tus datos."
+            st.markdown(
+                f"**Cómo se compone lo que entra este mes:**\n"
+                f"- ➕ Arrastre del mes anterior (ventas de fin del mes pasado, liberadas ahora): "
+                f"**{fmt_currency(_cob['carry_in_mes_anterior'])}**\n"
+                f"- ➕ De ventas de este mes (lo que MP libera antes de fin de mes): "
+                f"**{fmt_currency(_cob['de_ventas_del_mes'])}**\n"
+                f"- 🟰 **Entra este mes: {fmt_currency(_entra)}**\n"
+                f"- ↪️ Se cobra recién el mes que viene (ventas de fin de mes que MP libera después): "
+                f"**{fmt_currency(_cob['spill_al_mes_siguiente'])}** — no cuenta en este mes"
             )
         else:
             st.caption("💰 Cobranza: no se pudo calcular en este momento.")
