@@ -372,6 +372,33 @@ if page == "🏠 Resumen":
         else:
             st.caption("📏 El backtest todavía no tiene datos suficientes para estimar el rango.")
 
+        # ── Cobranza proyectada (Mercado Pago) con timing real ────────
+        # Aplica la curva de liberación de MP a las ventas diarias: cuenta solo
+        # lo que se libera DENTRO del mes, suma el arrastre del mes anterior y
+        # descuenta lo que se va al mes siguiente por las ventas de fin de mes.
+        try:
+            _cob = clients["sales"].get_cobranza_forecast()
+        except Exception as _e:
+            _cob = {"error": str(_e)}
+        if _cob and "error" not in _cob:
+            st.markdown("#### 💰 Cobranza proyectada (Mercado Pago)")
+            cb1, cb2, cb3 = st.columns(3)
+            cb1.metric("Cobranza neta del mes", fmt_currency(_cob["cobranza_mes"]),
+                       help="Lo que realmente entra a tu cuenta MP este mes, con el timing "
+                            "de liberación real (no todas las ventas del mes se cobran en el mes).")
+            cb2.metric("Ventas del mes (bruto)", fmt_currency(_cob["ventas_proyectadas"]))
+            cb3.metric("Tasa neta MP", f"{_cob['tasa']:.0%}")
+            st.caption(
+                f"Desglose: de ventas de este mes **{fmt_currency(_cob['de_ventas_del_mes'])}** "
+                f"+ arrastre del mes anterior **{fmt_currency(_cob['carry_in_mes_anterior'])}**. "
+                f"Se corre al mes que viene **{fmt_currency(_cob['spill_al_mes_siguiente'])}** "
+                f"(ventas de fin de mes que MP libera después). "
+                f"El atajo ventas×tasa daría {fmt_currency(_cob['naive_ventas_x_tasa'])}; el timing real "
+                f"lo ajusta según la curva de liberación medida de tus datos."
+            )
+        else:
+            st.caption("💰 Cobranza: no se pudo calcular en este momento.")
+
         st.markdown("#### Acumulado real vs proyección")
         ac1, ac2, ac3 = st.columns(3)
         with ac1:
