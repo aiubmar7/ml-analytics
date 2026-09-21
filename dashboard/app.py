@@ -403,6 +403,47 @@ if page == "🏠 Resumen":
         else:
             st.caption("💰 Cobranza: no se pudo calcular en este momento.")
 
+        # ── 🏦 Caja del mes (cuánto vas a poder retirar) ──────────────
+        if _cob and "error" not in _cob:
+            st.markdown("#### 🏦 Caja del mes")
+            _mes_key = forecast["month"]  # p.ej. "September 2026"
+            # Cuánto llevás retirado (dato tuyo): se guarda en Dropbox por mes.
+            _caja_cfg = {}
+            try:
+                _caja_cfg = clients["storage"].load_json("config/caja_retirado.json") or {}
+            except Exception:
+                _caja_cfg = {}
+            _prev = float(_caja_cfg.get(_mes_key, 0.0))
+            _retirado = st.number_input(
+                "Ya retirado al banco este mes (incluí lo que esté en viaje)",
+                min_value=0.0, value=_prev, step=50000.0, format="%.0f",
+                help="Cargalo vos: la app no ve tus retiros. Incluí lo que sacaste aunque el "
+                     "banco todavía no lo haya procesado.")
+            if abs(_retirado - _prev) > 0.5:
+                try:
+                    _caja_cfg[_mes_key] = _retirado
+                    clients["storage"].save_json(_caja_cfg, "config/caja_retirado.json")
+                except Exception:
+                    pass
+
+            _libhoy   = _cob.get("liberado_a_hoy", 0.0)
+            _totalmes = _cob["cobranza_mes"]
+            _falta_retirar = max(0.0, _totalmes - _retirado)
+            _disp_sin_retirar = max(0.0, _libhoy - _retirado)
+
+            k1, k2, k3 = st.columns(3)
+            k1.metric("Falta por retirar este mes", fmt_currency(_falta_retirar),
+                      help="Cobranza total proyectada del mes menos lo que ya retiraste.")
+            k2.metric("Disponible en MP sin retirar", fmt_currency(_disp_sin_retirar),
+                      help="Ya liberado a tu cuenta MP que todavía no mandaste al banco. Lo podés retirar ya.")
+            k3.metric("Cae recién en octubre", fmt_currency(_cob["spill_al_mes_siguiente"]),
+                      help="Ventas de fin de mes que MP libera el mes que viene.")
+            st.caption(
+                f"Cobranza total del mes ~{fmt_currency(_totalmes)} · ya liberado a MP hoy "
+                f"~{fmt_currency(_libhoy)} · ya retirado (vos) {fmt_currency(_retirado)}. "
+                f"Números netos (tasa {_cob['tasa']:.0%}) y proyectados — el saldo exacto está en tu cuenta MP."
+            )
+
         st.markdown("#### Acumulado real vs proyección")
         ac1, ac2, ac3 = st.columns(3)
         with ac1:
