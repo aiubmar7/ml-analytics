@@ -753,11 +753,22 @@ class MySalesExtractor:
             spill_out += s * rate * (1.0 - frac_in)
 
         total = cob_mes + carry_in
+
+        # Ya liberado a MP a la fecha (release date entre inicio de mes y hoy):
+        # sirve para saber cuánto podés retirar hoy y cuánto queda por liberar.
+        liberado_hoy = 0.0
+        for d, s in daily.items():
+            frac = self._release_cum((today - d).days) - self._release_cum((month_start - d).days - 1)
+            if frac > 0:
+                liberado_hoy += float(s) * rate * frac
+
         return {
             "cobranza_mes":              round(total, 2),
             "de_ventas_del_mes":         round(cob_mes, 2),
             "carry_in_mes_anterior":     round(carry_in, 2),
             "spill_al_mes_siguiente":    round(spill_out, 2),
+            "liberado_a_hoy":            round(liberado_hoy, 2),
+            "falta_liberar_mes":         round(total - liberado_hoy, 2),
             "ventas_proyectadas":        round(rev_month, 2),
             "naive_ventas_x_tasa":       round(rev_month * rate, 2),
             "tasa":                      rate,
