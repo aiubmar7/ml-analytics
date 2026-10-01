@@ -272,9 +272,9 @@ if page == "🏠 Resumen":
     with col2:
         st.metric("Unidades vendidas", summary["total_units"])
     with col3:
-        st.metric("Ingresos brutos", fmt_currency(summary["total_revenue"]))
+        st.metric(f"Ingresos brutos (últ. {days_back} días)", fmt_currency(summary["total_revenue"]))
     with col4:
-        st.metric("Ingresos netos", fmt_currency(summary["net_revenue"]))
+        st.metric(f"Ingresos netos (últ. {days_back} días)", fmt_currency(summary["net_revenue"]))
 
     st.markdown("---")
     col_left, col_right = st.columns(2)
@@ -431,12 +431,15 @@ if page == "🏠 Resumen":
             _falta_retirar = max(0.0, _totalmes - _retirado)
             _disp_sin_retirar = max(0.0, _libhoy - _retirado)
 
+            _meses_es = ["", "enero", "febrero", "marzo", "abril", "mayo", "junio",
+                         "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre"]
+            _mes_sig = _meses_es[(date.today().month % 12) + 1]
             k1, k2, k3 = st.columns(3)
             k1.metric("Falta por retirar este mes", fmt_currency(_falta_retirar),
                       help="Cobranza total proyectada del mes menos lo que ya retiraste.")
             k2.metric("Disponible en MP sin retirar", fmt_currency(_disp_sin_retirar),
                       help="Ya liberado a tu cuenta MP que todavía no mandaste al banco. Lo podés retirar ya.")
-            k3.metric("Cae recién en octubre", fmt_currency(_cob["spill_al_mes_siguiente"]),
+            k3.metric(f"Cae recién en {_mes_sig}", fmt_currency(_cob["spill_al_mes_siguiente"]),
                       help="Ventas de fin de mes que MP libera el mes que viene.")
             st.caption(
                 f"Cobranza total del mes ~{fmt_currency(_totalmes)} · ya liberado a MP hoy "
