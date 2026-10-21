@@ -988,100 +988,20 @@ elif page == "🗄️ Historial":
 
 elif page == "🔍 Competencia":
     st.title("🔍 Análisis de Competencia")
-    clients = get_clients()
-
-    tab_tracker, tab_search = st.tabs(["🎯 La Tentación", "🔍 Buscar otro competidor"])
-
-    with tab_tracker:
-        col_scan, _ = st.columns([1, 3])
-        with col_scan:
-            scan_btn = st.button("🔄 Escanear ahora")
-
-        tracker = CompetitorTracker(seller_id=175850089, seller_nickname="LATENTACIONSRL")
-
-        if scan_btn:
-            with st.spinner("Escaneando publicaciones de La Tentación..."):
-                df_tracker = tracker.save_snapshot()
-        else:
-            with st.spinner("Cargando último snapshot..."):
-                df_tracker = tracker.load_snapshot()
-                if df_tracker is None:
-                    st.info("No hay datos aún. Hacé clic en 'Escanear ahora'.")
-                    df_tracker = pd.DataFrame()
-
-        if not df_tracker.empty:
-            summary = tracker.get_summary()
-            m1, m2, m3, m4 = st.columns(4)
-            m1.metric("Publicaciones encontradas", summary["total_items"])
-            m2.metric("Precio promedio", f"${summary['avg_price']:,.0f}")
-            m3.metric("Precio mínimo", f"${summary['min_price']:,.0f}")
-            m4.metric("Precio máximo", f"${summary['max_price']:,.0f}")
-            st.caption(f"Último scan: {summary.get('last_snapshot', '—')}")
-
-            cats = summary.get("categories_found", {})
-            if cats:
-                st.markdown("**Items por categoría:**")
-                cols_cat = st.columns(len(cats))
-                for i, (cat, count) in enumerate(cats.items()):
-                    cols_cat[i].metric(cat.title(), count)
-
-            t1, t2, t3 = st.tabs(["📋 Todas las publicaciones", "🆕 Nuevas publicaciones", "💰 Cambios de precio"])
-            with t1:
-                cols_show = ["title", "price", "available_qty", "sold_qty", "category", "listing_type", "permalink"]
-                st.dataframe(df_tracker[[c for c in cols_show if c in df_tracker.columns]], use_container_width=True)
-            with t2:
-                df_new = tracker.detect_new_items()
-                if df_new.empty:
-                    st.info("No hay publicaciones nuevas desde el último scan.")
-                else:
-                    st.success(f"🆕 {len(df_new)} publicaciones nuevas detectadas")
-                    st.dataframe(df_new[["title", "price", "category", "permalink"]], use_container_width=True)
-            with t3:
-                df_price = tracker.detect_price_changes()
-                if df_price.empty:
-                    st.info("No hay cambios de precio desde el último scan.")
-                else:
-                    st.warning(f"💰 {len(df_price)} cambios de precio detectados")
-                    st.dataframe(df_price[["title", "prev_price", "price", "price_diff", "price_diff_pct", "direction"]], use_container_width=True)
-
-    with tab_search:
-        st.subheader("Buscar competidor")
-        col_input, col_btn = st.columns([3, 1])
-        with col_input:
-            seller_input = st.text_input("Nickname o User ID del competidor", placeholder="Ej: nombre_vendedor o 123456789")
-        with col_btn:
-            st.write("")
-            search_btn = st.button("🔍 Analizar")
-
-        if search_btn and seller_input:
-            with st.spinner(f"Analizando {seller_input}..."):
-                if not seller_input.isdigit():
-                    user = clients["competition"].search_seller_by_nickname(seller_input)
-                    if not user:
-                        st.error(f"No se encontró el vendedor '{seller_input}'")
-                        st.stop()
-                    seller_id = str(user["id"])
-                    st.success(f"Vendedor encontrado: **{user.get('nickname')}** (ID: {seller_id})")
-                else:
-                    seller_id = seller_input
-
-                profile = clients["competition"].get_seller_profile(seller_id)
-                col1, col2, col3 = st.columns(3)
-                col1.metric("Nivel", profile.get("level_id", "—"))
-                col2.metric("Transacciones", f"{profile.get('transactions_total', 0):,}")
-                col3.metric("Power Seller", profile.get("power_seller_status", "—"))
-
-                st.subheader("Publicaciones activas")
-                df_items = clients["competition"].sync_seller(seller_id)
-                if not df_items.empty:
-                    col_a, col_b, col_c = st.columns(3)
-                    col_a.metric("Total publicaciones", len(df_items))
-                    col_b.metric("Precio promedio", fmt_currency(df_items["price"].mean()))
-                    col_c.metric("Unidades vendidas totales", f"{df_items['sold_qty'].sum():,}")
-                    fig = px.histogram(df_items, x="price", nbins=20, title="Distribución de precios", color_discrete_sequence=["#3483FA"])
-                    st.plotly_chart(fig, use_container_width=True)
-                    cols_show = ["title", "price", "sold_qty", "available_qty", "listing_type", "permalink"]
-                    st.dataframe(df_items[[c for c in cols_show if c in df_items.columns]], use_container_width=True)
+    st.info(
+        "**No disponible por restricción de Mercado Libre.**\n\n"
+        "Desde 2025 ML cerró el acceso por API a los datos de otros vendedores: "
+        "no se puede listar el catálogo de un competidor, ni leer sus publicaciones "
+        "(precio/stock), ni buscar vendedores por nombre. Lo verificamos en vivo con "
+        "la cuenta autorizada y todos esos endpoints devuelven **403**.\n\n"
+        "No es un problema de esta app ni de los permisos de tu cuenta — es política "
+        "de la plataforma. Para seguir competencia haría falta una herramienta externa "
+        "tipo Nubimetrics, que usa otros medios."
+    )
+    st.caption(
+        "El módulo 📈 Tendencias sí funciona: muestra las búsquedas más "
+        "populares de ML (demanda real)."
+    )
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -1105,33 +1025,43 @@ elif page == "📈 Tendencias":
     selected_cat_name = st.selectbox("Seleccioná una categoría", list(cat_options.keys()))
     selected_cat_id   = cat_options[selected_cat_name]
 
-    col_btn, _ = st.columns([1, 4])
-    with col_btn:
-        analyze_btn = st.button("📊 Analizar categoría")
+    st.caption(
+        "Las búsquedas más populares en Mercado Libre Uruguay ahora mismo "
+        "(datos oficiales de ML). Sirve para ver qué está demandando la gente "
+        "y decidir qué publicar o empujar."
+    )
 
-    if analyze_btn:
-        with st.spinner(f"Analizando {selected_cat_name}..."):
-            tab1, tab2, tab3 = st.tabs(["🏆 Top Items", "🔍 Tendencias", "💡 Oportunidades"])
-            with tab1:
-                df_top = clients["categories"].get_top_items_in_category(selected_cat_id)
-                if not df_top.empty:
-                    st.dataframe(df_top[["title", "price", "sold_qty", "seller_nickname", "permalink"]], use_container_width=True)
-                else:
-                    st.info("Sin datos.")
-            with tab2:
-                df_trends = clients["categories"].get_search_trends(selected_cat_id)
-                if not df_trends.empty:
-                    for _, row in df_trends.iterrows():
-                        st.write(f"**#{row['rank']}** {row['keyword']}")
-                else:
-                    st.info("Sin datos de tendencias para esta categoría.")
-            with tab3:
-                df_opp = clients["categories"].find_opportunities(selected_cat_id)
-                if not df_opp.empty:
-                    st.success(f"Se encontraron {len(df_opp)} oportunidades")
-                    st.dataframe(df_opp[["title", "sold_qty", "seller_count", "opportunity_score", "price"]], use_container_width=True)
-                else:
-                    st.info("Sin oportunidades claras en esta categoría.")
+    _trend_cols = {
+        "rank":    st.column_config.NumberColumn("#", width="small"),
+        "keyword": st.column_config.TextColumn("Búsqueda"),
+        "url":     st.column_config.LinkColumn("Ver en ML", display_text="abrir"),
+    }
+
+    # ── Tendencias generales del sitio ────────────────────────────
+    st.subheader("🔥 Lo más buscado en Mercado Libre Uruguay")
+    with st.spinner("Cargando tendencias..."):
+        df_gen = clients["categories"].get_search_trends()
+    if not df_gen.empty:
+        st.dataframe(
+            df_gen[["rank", "keyword", "url"]],
+            use_container_width=True, hide_index=True, column_config=_trend_cols,
+        )
+    else:
+        st.info("No se pudieron cargar las tendencias generales en este momento.")
+
+    # ── Tendencias por categoría ──────────────────────────────────
+    st.markdown("---")
+    st.subheader(f"📂 Lo más buscado en: {selected_cat_name}")
+    if st.button("📊 Ver tendencias de esta categoría"):
+        with st.spinner(f"Buscando tendencias de {selected_cat_name}..."):
+            df_cat = clients["categories"].get_search_trends(selected_cat_id)
+        if not df_cat.empty:
+            st.dataframe(
+                df_cat[["rank", "keyword", "url"]],
+                use_container_width=True, hide_index=True, column_config=_trend_cols,
+            )
+        else:
+            st.info("Esta categoría no tiene tendencias disponibles en este momento.")
 
 
 # ══════════════════════════════════════════════════════════════════

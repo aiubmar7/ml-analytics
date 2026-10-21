@@ -98,27 +98,33 @@ class CategoriesExtractor:
 
     # ─── Tendencias de búsqueda ───────────────────────────────────
 
-    def get_search_trends(self, category_id: str) -> pd.DataFrame:
+    def get_search_trends(self, category_id: str = None) -> pd.DataFrame:
         """
-        Retorna las palabras más buscadas en una categoría.
-        Muy útil para optimizar títulos de tus publicaciones.
+        Retorna las palabras más buscadas en Mercado Libre.
+        Si se pasa category_id, filtra por esa categoría; si no, trae las
+        tendencias generales del sitio. Útil para ver qué demanda hay y
+        optimizar títulos / decidir qué publicar.
+
+        Endpoint:  /trends/{site}            (general)
+                   /trends/{site}/{category} (por categoría)
         """
         try:
-            data = self.client.get(
-                f"/trends/{ML_SITE_ID}/category/{category_id}"
-            )
+            path = f"/trends/{ML_SITE_ID}"
+            if category_id:
+                path += f"/{category_id}"
+            data = self.client.get(path)
             rows = []
             for i, keyword in enumerate(data, 1):
                 rows.append({
-                    "rank":        i,
-                    "keyword":     keyword.get("keyword"),
-                    "url":         keyword.get("url"),
-                    "category_id": category_id,
+                    "rank":          i,
+                    "keyword":       keyword.get("keyword"),
+                    "url":           keyword.get("url"),
+                    "category_id":   category_id or "ALL",
                     "snapshot_date": datetime.now().isoformat(),
                 })
             return pd.DataFrame(rows)
         except Exception as e:
-            logger.warning(f"No se pudieron obtener trends para {category_id}: {e}")
+            logger.warning(f"No se pudieron obtener trends ({category_id or 'general'}): {e}")
             return pd.DataFrame()
 
     # ─── Análisis de demanda por keyword ─────────────────────────
