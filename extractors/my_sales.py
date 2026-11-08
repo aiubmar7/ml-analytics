@@ -706,7 +706,7 @@ class MySalesExtractor:
             "daily_trend_revenue": round(daily_trend_revenue, 2),
         }
 
-    def get_cobranza_forecast(self, as_of=None) -> dict:
+    def get_cobranza_forecast(self, as_of=None, forecast=None) -> dict:
         """Pronóstico de cobranza con TIMING real: aplica la curva de liberación
         de MP a las ventas DIARIAS (reales las transcurridas, proyectadas las que
         faltan) y cuenta solo lo que se libera DENTRO del mes. Suma lo que arrastra
@@ -716,7 +716,10 @@ class MySalesExtractor:
         dim = calendar.monthrange(today.year, today.month)[1]
         de  = today.day
         rem = dim - de
-        fc = self.get_monthly_forecast(as_of=as_of)
+        # Usa el pronóstico ya calculado por el titular (con pesos optimizados y
+        # F10) si se lo pasan; así la cobranza y la facturación proyectada SIEMPRE
+        # muestran la misma venta. Solo recalcula (pesos base) como fallback.
+        fc = forecast if (forecast is not None and "error" not in forecast) else self.get_monthly_forecast(as_of=as_of)
         if not fc or "error" in fc:
             return {"error": (fc or {}).get("error", "sin pronóstico")}
         rev_month  = fc["forecast_revenue"]

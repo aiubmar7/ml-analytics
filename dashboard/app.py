@@ -377,7 +377,7 @@ if page == "🏠 Resumen":
         # lo que se libera DENTRO del mes, suma el arrastre del mes anterior y
         # descuenta lo que se va al mes siguiente por las ventas de fin de mes.
         try:
-            _cob = clients["sales"].get_cobranza_forecast()
+            _cob = clients["sales"].get_cobranza_forecast(forecast=forecast)
         except Exception as _e:
             _cob = {"error": str(_e)}
         if _cob and "error" not in _cob:
