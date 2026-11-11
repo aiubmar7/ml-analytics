@@ -18,6 +18,7 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+import plotly.io as pio
 from auth.ml_auth import get_valid_access_token
 from auth.ml_client import MLClient
 from extractors.my_sales import MySalesExtractor
@@ -28,6 +29,34 @@ from extractors.keywords import KeywordsExtractor
 from storage.dropbox_client import DropboxClient
 
 logging.basicConfig(level=logging.INFO)
+
+# ─── Template oscuro único para TODOS los gráficos Plotly ──────────────
+# Se registra una sola vez y queda por defecto: cada chart hereda fondo
+# transparente, grillas sutiles, tipografía clara y una paleta coherente,
+# sin tener que tocar cada fig.update_layout del archivo.
+_ACCENT   = "#14b47c"   # verde marca
+_GRID     = "#242b3a"
+_AXIS     = "#39415480"
+_FONT_CLR = "#cfd4dd"
+pio.templates["eldom_dark"] = go.layout.Template(
+    layout=dict(
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(color=_FONT_CLR, family="Samsung Sans, sans-serif", size=13),
+        title=dict(font=dict(color="#e6e9ef", size=16)),
+        colorway=["#14b47c", "#3483FA", "#FFC043", "#FF6B6B", "#9B8CFF", "#49C5B6"],
+        xaxis=dict(gridcolor=_GRID, zerolinecolor=_GRID, linecolor=_AXIS,
+                   tickfont=dict(color="#9aa3b2")),
+        yaxis=dict(gridcolor=_GRID, zerolinecolor=_GRID, linecolor=_AXIS,
+                   tickfont=dict(color="#9aa3b2")),
+        legend=dict(bgcolor="rgba(0,0,0,0)", bordercolor="rgba(0,0,0,0)"),
+        margin=dict(t=52, l=10, r=10, b=10),
+        hoverlabel=dict(bgcolor="#171c28", bordercolor="#39415480",
+                        font=dict(color="#e6e9ef", family="Samsung Sans, sans-serif")),
+    )
+)
+pio.templates.default = "eldom_dark"
+px.defaults.template   = "eldom_dark"
 
 st.set_page_config(
     page_title="ML Analytics",
@@ -40,39 +69,106 @@ st.set_page_config(
 st.markdown("""
 <style>
 @import url('https://fonts.cdnfonts.com/css/samsung-sans');
+
+:root {
+    --bg:      #0e1117;
+    --card:    #171c28;
+    --card-2:  #1b2130;
+    --border:  #242b3a;
+    --text:    #e6e9ef;
+    --muted:   #9aa3b2;
+    --accent:  #14b47c;
+}
+
 html, body, [class*="css"], p, div, span, label, input, button {
     font-family: 'Samsung Sans', sans-serif !important;
     font-size: 14px !important;
 }
-h1 { font-size: 24px !important; }
-h2 { font-size: 20px !important; }
-h3 { font-size: 17px !important; }
-[data-testid="metric-container"] label { font-size: 13px !important; }
-[data-testid="metric-container"] [data-testid="stMetricValue"] { font-size: 20px !important; }
 
-/* Botón primario (Usar el pronóstico que erra menos): grande y minimalista */
+/* Tipografía de títulos: más aire, menos peso, color suave */
+h1 { font-size: 26px !important; font-weight: 600 !important; letter-spacing: .2px; }
+h2 { font-size: 20px !important; font-weight: 600 !important; }
+h3 { font-size: 16px !important; font-weight: 600 !important; color: var(--text) !important; }
+
+/* Ancho de lectura cómodo y respiración arriba */
+.block-container { padding-top: 2.2rem !important; max-width: 1280px; }
+
+/* ── Métricas como tarjetas minimalistas ───────────────────────── */
+[data-testid="stMetric"],
+[data-testid="metric-container"] {
+    background: var(--card) !important;
+    border: 1px solid var(--border) !important;
+    border-radius: 14px !important;
+    padding: 16px 18px !important;
+    transition: border-color .2s ease, transform .05s ease;
+}
+[data-testid="stMetric"]:hover,
+[data-testid="metric-container"]:hover { border-color: #313a4e !important; }
+[data-testid="stMetric"] label,
+[data-testid="metric-container"] label {
+    font-size: 13px !important; color: var(--muted) !important;
+    letter-spacing: .2px; white-space: normal !important; line-height: 1.3 !important;
+}
+/* Que el label largo no se corte con "…": permitir 2 líneas */
+[data-testid="stMetric"] label p,
+[data-testid="stMetricLabel"] div { white-space: normal !important; overflow: visible !important; }
+[data-testid="stMetricValue"] { font-size: 22px !important; font-weight: 600 !important; }
+
+/* ── Sidebar: panel limpio y separado ──────────────────────────── */
+[data-testid="stSidebar"] { background: #0b0e14 !important; border-right: 1px solid var(--border); }
+[data-testid="stSidebar"] .block-container { padding-top: 1.5rem !important; }
+
+/* Divisores sutiles */
+hr { border-color: var(--border) !important; opacity: .6; }
+
+/* Tabs minimalistas */
+[data-baseweb="tab-list"] { gap: 4px; border-bottom: 1px solid var(--border); }
+[data-baseweb="tab"] { font-size: 13px !important; }
+
+/* Tablas / dataframes integradas al fondo */
+[data-testid="stDataFrame"] { border: 1px solid var(--border); border-radius: 12px; }
+
+/* Cajas de info/warning más suaves (menos saturadas) */
+[data-testid="stAlert"] { border-radius: 12px !important; border: 1px solid var(--border) !important; }
+
+/* Expanders como tarjetas */
+[data-testid="stExpander"] { border: 1px solid var(--border) !important; border-radius: 12px !important; background: var(--card) !important; }
+
+/* ── Botón primario (🎯 Usar el pronóstico que erra menos) ──────── */
 .stButton > button[kind="primary"],
 div[data-testid="stButton"] > button[kind="primary"] {
-    background: #14a06e !important;
-    color: #ffffff !important;
+    background: var(--accent) !important;
+    color: #04130d !important;
     border: none !important;
     border-radius: 12px !important;
     padding: 18px 24px !important;
     font-size: 16px !important;
-    font-weight: 600 !important;
+    font-weight: 700 !important;
     letter-spacing: 0.2px !important;
-    box-shadow: 0 2px 10px rgba(20,160,110,0.25) !important;
-    transition: background 0.2s ease, transform 0.05s ease !important;
+    box-shadow: 0 2px 14px rgba(20,180,124,0.28) !important;
+    transition: background 0.2s ease, transform 0.05s ease, box-shadow .2s ease !important;
 }
 .stButton > button[kind="primary"]:hover,
 div[data-testid="stButton"] > button[kind="primary"]:hover {
-    background: #12b47c !important;
-    box-shadow: 0 4px 16px rgba(20,160,110,0.35) !important;
+    background: #19cc8d !important;
+    box-shadow: 0 4px 20px rgba(20,180,124,0.4) !important;
 }
 .stButton > button[kind="primary"]:active,
 div[data-testid="stButton"] > button[kind="primary"]:active {
     transform: translateY(1px) !important;
 }
+
+/* Botón secundario: contorno discreto */
+.stButton > button[kind="secondary"] {
+    background: var(--card) !important;
+    border: 1px solid var(--border) !important;
+    border-radius: 10px !important;
+    color: var(--text) !important;
+}
+.stButton > button[kind="secondary"]:hover { border-color: var(--accent) !important; color: var(--accent) !important; }
+
+/* Ocultar ruido de Streamlit (menú, footer, botón deploy) */
+#MainMenu, footer, [data-testid="stDecoration"] { visibility: hidden; }
 </style>
 """, unsafe_allow_html=True)
 

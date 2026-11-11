@@ -1,0 +1,17 @@
+# Tema nocturno minimalista — ML Analytics (Eldom)
+# Theming nativo de Streamlit: aplica a TODOS los widgets, sidebar, inputs
+# y dataframes de forma coherente en oscuro (sin hacks de CSS por widget).
+
+[theme]
+base = "dark"
+primaryColor = "#14b47c"              # verde de marca (acento, botones, selección)
+backgroundColor = "#0e1117"           # fondo principal (negro azulado profundo)
+secondaryBackgroundColor = "#171c28"  # tarjetas, sidebar, inputs
+textColor = "#e6e9ef"                 # texto suave (no blanco puro: más amable)
+font = "sans serif"
+
+[client]
+toolbarMode = "minimal"               # menos ruido en la barra superior
+
+[ui]
+hideTopBar = false
