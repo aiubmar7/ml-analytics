@@ -37,7 +37,7 @@ logging.basicConfig(level=logging.INFO)
 # sin tener que tocar cada fig.update_layout del archivo.
 _ACCENT   = "#14b47c"   # verde marca
 _GRID     = "#242b3a"
-_AXIS     = "#39415480"
+_AXIS     = "rgba(57,65,84,0.5)"   # rgba (no hex de 8 dígitos: Plotly viejo lo rechaza)
 _FONT_CLR = "#cfd4dd"
 pio.templates["eldom_dark"] = go.layout.Template(
     layout=dict(
@@ -52,7 +52,7 @@ pio.templates["eldom_dark"] = go.layout.Template(
                    tickfont=dict(color="#9aa3b2")),
         legend=dict(bgcolor="rgba(0,0,0,0)", bordercolor="rgba(0,0,0,0)"),
         margin=dict(t=52, l=10, r=10, b=10),
-        hoverlabel=dict(bgcolor="#171c28", bordercolor="#39415480",
+        hoverlabel=dict(bgcolor="#171c28", bordercolor="rgba(57,65,84,0.5)",
                         font=dict(color="#e6e9ef", family="Samsung Sans, sans-serif")),
     )
 )
