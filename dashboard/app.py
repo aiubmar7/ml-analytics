@@ -270,6 +270,13 @@ st.sidebar.markdown(f"*Período: últimos {days_back} días*")
 def fmt_currency(value: float, currency: str = "UYU") -> str:
     return f"${value:,.0f} {currency}"
 
+def fmt_md(value: float, currency: str = "UYU") -> str:
+    # Igual que fmt_currency pero con el "$" ESCAPADO. En st.markdown/caption/info
+    # dos "$" en una misma línea activan el modo fórmula (LaTeX) de Streamlit y
+    # rompen/duplican el texto del medio. Usar esta variante en esos contextos;
+    # fmt_currency queda para st.metric (que no interpreta markdown).
+    return f"\\${value:,.0f} {currency}"
+
 def show_period_detail(summary: dict, label: str):
     if summary["revenue"] == 0:
         st.warning(f"Sin datos para {label}. Cargá el historial desde 🗄️ Historial.")
@@ -465,7 +472,7 @@ if page == "🏠 Resumen":
             _mape = round(_mape, 1)
             _lo, _hi = _rev * (1 - _mape / 100), _rev * (1 + _mape / 100)
             st.info(
-                f"📏 **Rango probable:** {fmt_currency(_lo)} — {fmt_currency(_hi)}  "
+                f"📏 **Rango probable:** {fmt_md(_lo)} — {fmt_md(_hi)}  "
                 f"(±{_mape}%, error típico del backtest para el día {_d}). "
                 f"El rango se angosta a medida que avanza el mes."
             )
@@ -493,12 +500,12 @@ if page == "🏠 Resumen":
             st.markdown(
                 f"**Cómo se compone lo que entra este mes:**\n"
                 f"- ➕ Arrastre del mes anterior (ventas de fin del mes pasado, liberadas ahora): "
-                f"**{fmt_currency(_cob['carry_in_mes_anterior'])}**\n"
+                f"**{fmt_md(_cob['carry_in_mes_anterior'])}**\n"
                 f"- ➕ De ventas de este mes (lo que MP libera antes de fin de mes): "
-                f"**{fmt_currency(_cob['de_ventas_del_mes'])}**\n"
-                f"- 🟰 **Entra este mes: {fmt_currency(_entra)}**\n"
+                f"**{fmt_md(_cob['de_ventas_del_mes'])}**\n"
+                f"- 🟰 **Entra este mes: {fmt_md(_entra)}**\n"
                 f"- ↪️ Se cobra recién el mes que viene (ventas de fin de mes que MP libera después): "
-                f"**{fmt_currency(_cob['spill_al_mes_siguiente'])}** — no cuenta en este mes"
+                f"**{fmt_md(_cob['spill_al_mes_siguiente'])}** — no cuenta en este mes"
             )
         else:
             st.caption("💰 Cobranza: no se pudo calcular en este momento.")
@@ -542,8 +549,8 @@ if page == "🏠 Resumen":
             k3.metric(f"Cae recién en {_mes_sig}", fmt_currency(_cob["spill_al_mes_siguiente"]),
                       help="Ventas de fin de mes que MP libera el mes que viene.")
             st.caption(
-                f"Cobranza total del mes ~{fmt_currency(_totalmes)} · ya liberado a MP hoy "
-                f"~{fmt_currency(_libhoy)} · ya retirado (vos) {fmt_currency(_retirado)}. "
+                f"Cobranza total del mes ~{fmt_md(_totalmes)} · ya liberado a MP hoy "
+                f"~{fmt_md(_libhoy)} · ya retirado (vos) {fmt_md(_retirado)}. "
                 f"Números netos (tasa {_cob['tasa']:.0%}) y proyectados — el saldo exacto está en tu cuenta MP."
             )
 
@@ -563,8 +570,8 @@ if page == "🏠 Resumen":
                 st.caption(
                     f"🧭 **Factor 10 — Regresión a la media** aplicado: la proyección se "
                     f"tiró un {lam:.0%} hacia la expectativa histórica con crecimiento "
-                    f"({fmt_currency(forecast.get('reversion_target', 0))}, promedio de F3/F8/F9). "
-                    f"Antes de F10 el ensemble daba {fmt_currency(forecast.get('ensemble_revenue', 0))}. "
+                    f"({fmt_md(forecast.get('reversion_target', 0))}, promedio de F3/F8/F9). "
+                    f"Antes de F10 el ensemble daba {fmt_md(forecast.get('ensemble_revenue', 0))}. "
                     f"La corrección es más fuerte a principio de mes (cuando el arranque es menos "
                     f"confiable) y se desvanece hacia fin de mes."
                 )
