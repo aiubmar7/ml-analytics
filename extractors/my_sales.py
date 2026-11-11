@@ -59,13 +59,36 @@ class MySalesExtractor:
             self.user_id = str(me["id"])
         return self.user_id
 
-    def get_orders(self, days_back: int = DEFAULT_DAYS_BACK) -> pd.DataFrame:
+    def _seller_shipping_cost(self, shipping_id) -> float:
+        """Costo de envío que paga el VENDEDOR en una orden. Solo cuenta ME2 con
+        envío GRATIS para el comprador (su cost == 0): ahí el vendedor paga el
+        list_cost. ME1 y envíos que paga el comprador => 0. Validado contra
+        ventas reales (oct-2026): mode=='me2' y shipping_option.cost==0 =>
+        list_cost; si el comprador pagó, 0. Consulta /shipments/{id}."""
+        if not shipping_id:
+            return 0.0
+        try:
+            s = self.client.get(f"/shipments/{shipping_id}")
+        except Exception:
+            return 0.0
+        if s.get("mode") != "me2":                      # excluir ME1 y otros
+            return 0.0
+        opt   = s.get("shipping_option") or {}
+        buyer = float(opt.get("cost") or 0)
+        listc = float(opt.get("list_cost") or 0)
+        return listc if buyer == 0 else 0.0
+
+    def get_orders(self, days_back: int = DEFAULT_DAYS_BACK, with_shipping: bool = False) -> pd.DataFrame:
         # Cache con TTL de 10 min: evita re-bajar la misma data en cada
         # carga/refresco de la página (lo que martillaba la API y
         # disparaba el rate limit). El objeto persiste entre reruns por
         # el @st.cache_resource de get_clients() en app.py.
+        # with_shipping agrega 1 llamada /shipments por orden (lento): por eso
+        # está apagado por defecto (dashboard rápido) y solo lo prende el
+        # cálculo de renta / snapshot.
         import time as _time
-        _cached = self._orders_cache.get(days_back)
+        _ckey   = (days_back, with_shipping)
+        _cached = self._orders_cache.get(_ckey)
         if _cached and (_time.time() - _cached[0]) < 600:
             return _cached[1]
 
@@ -81,6 +104,11 @@ class MySalesExtractor:
             results_key="results",
             max_items=10000,
         ):
+            # Envío del vendedor: 1 sola consulta /shipments por ORDEN, y se
+            # carga en la 1ra fila del pedido (0 en las demás) para que al
+            # sumar shipping_cost no se duplique en pedidos multi-ítem.
+            _ship = self._seller_shipping_cost(order.get("shipping", {}).get("id")) if with_shipping else 0.0
+            _first = True
             for item in order.get("order_items", []):
                 orders.append({
                     "order_id":       order["id"],
@@ -97,17 +125,20 @@ class MySalesExtractor:
                     "buyer_id":       order.get("buyer", {}).get("id"),
                     "buyer_nickname": order.get("buyer", {}).get("nickname"),
                     "shipping_id":    order.get("shipping", {}).get("id"),
+                    "shipping_cost":  (_ship if _first else 0.0),
                 })
+                _first = False
         if not orders:
             return pd.DataFrame()
         df = pd.DataFrame(orders)
         df["date_created"] = pd.to_datetime(df["date_created"])
         df["date_closed"]  = pd.to_datetime(df["date_closed"], errors="coerce")
         df["net_amount"]   = df["total_amount"] - df["sale_fee"]
-        self._orders_cache[days_back] = (_time.time(), df)
+        self._orders_cache[_ckey] = (_time.time(), df)
         return df
 
-    def get_orders_by_daterange(self, date_from: date, date_to: date) -> pd.DataFrame:
+    def get_orders_by_daterange(self, date_from: date, date_to: date,
+                                with_shipping: bool = False) -> pd.DataFrame:
         user_id  = self._get_user_id()
         from_str = date_from.strftime("%Y-%m-%dT00:00:00.000-03:00")
         to_str   = date_to.strftime("%Y-%m-%dT23:59:59.000-03:00")
@@ -125,6 +156,8 @@ class MySalesExtractor:
             results_key="results",
             max_items=10000,
         ):
+            _ship = self._seller_shipping_cost(order.get("shipping", {}).get("id")) if with_shipping else 0.0
+            _first = True
             for item in order.get("order_items", []):
                 orders.append({
                     "order_id":     order["id"],
@@ -137,7 +170,10 @@ class MySalesExtractor:
                     "quantity":     item["quantity"],
                     "unit_price":   item["unit_price"],
                     "sale_fee":     item.get("sale_fee", 0),
+                    "shipping_id":  order.get("shipping", {}).get("id"),
+                    "shipping_cost": (_ship if _first else 0.0),
                 })
+                _first = False
         if not orders:
             return pd.DataFrame()
         df = pd.DataFrame(orders)
