@@ -22,6 +22,7 @@ import plotly.io as pio
 from auth.ml_auth import get_valid_access_token
 from auth.ml_client import MLClient
 from extractors.my_sales import MySalesExtractor
+from extractors.renta import RentaCalculator
 from extractors.competition import CompetitionExtractor
 from extractors.competitor_tracker import CompetitorTracker
 from extractors.categories import CategoriesExtractor
@@ -174,12 +175,15 @@ div[data-testid="stButton"] > button[kind="primary"]:active {
 
 @st.cache_resource
 def get_clients():
+    _sales   = MySalesExtractor()
+    _storage = DropboxClient()
     return {
-        "sales":       MySalesExtractor(),
+        "sales":       _sales,
+        "renta":       RentaCalculator(_sales, _storage),
         "competition": CompetitionExtractor(),
         "categories":  CategoriesExtractor(),
         "keywords":    KeywordsExtractor(),
-        "storage":     DropboxClient(),
+        "storage":     _storage,
     }
 
 
@@ -612,6 +616,70 @@ if page == "🏠 Resumen":
                           help="Ancla histórica con crecimiento (prom. F3/F8/F9). Corrige el arranque atípico; más fuerte a principio de mes.")
             if forecast.get("vs_last_year_pct") is not None:
                 st.info(f"📊 Crecimiento vs mismo mes del año anterior: **{forecast['vs_last_year_pct']:+.1f}%**")
+
+        # ── 💵 Renta del mes (neto operativo ML) ──────────────────────
+        st.markdown("---")
+        st.markdown("#### 💵 Renta del mes (canal ML)")
+        st.caption("Facturación × 0,81 (neto MP: comisión + retenciones) − costo de mercadería "
+                   "− publicidad − envíos ME2. Sólo canal ML, mes proyectado a fin de mes.")
+        rc = clients["renta"]
+        _rp = rc.load_params()
+        rpc1, rpc2 = st.columns(2)
+        with rpc1:
+            _tc = st.number_input("TC del mes (USD→UYU)", min_value=1.0,
+                                  value=float(_rp["tc"]), step=0.05, format="%.2f",
+                                  help="Tipo de cambio con que se valúa el costo de mercadería (USD).")
+        with rpc2:
+            _ads = st.number_input("Publicidad del mes — ADS (UYU)", min_value=0.0,
+                                   value=float(_rp["ads"]), step=50000.0, format="%.0f",
+                                   help="Inversión en Product Ads del mes. Cargala vos; la app no la ve.")
+        if abs(_tc - _rp["tc"]) > 1e-6 or abs(_ads - _rp["ads"]) > 0.5:
+            rc.save_params(_tc, _ads)
+
+        _bcol, _acol = st.columns([1, 2])
+        with _bcol:
+            _recalc = st.button("🔄 Calcular / actualizar renta", type="secondary",
+                                help="Costea las ventas del mes y recorre los envíos en la API "
+                                     "(~1 consulta por orden). Tarda unos segundos; queda cacheado.")
+        if _recalc:
+            with st.spinner("Costeando ventas y recorriendo envíos del mes… (unos segundos)"):
+                _renta, _age = rc.get_renta_cached(tc=_tc, ads=_ads, forecast=forecast, force=True)
+        else:
+            _renta, _age = rc.peek_cache(tc=_tc, ads=_ads)
+
+        if _renta is None:
+            st.caption("Todavía no calculaste la renta para este TC/ADS. Tocá **Calcular / actualizar renta**.")
+        elif "error" in _renta:
+            st.caption(f"💵 Renta: {_renta['error']}. Probá **Calcular / actualizar renta**.")
+        else:
+            with _acol:
+                st.caption(f"Actualizado hace {_age:.0f} h · cobertura de costeo "
+                           f"{_renta['match_coverage_pct']:.0f}% · TC {_renta['tc']:.2f}")
+            rm1, rm2, rm3, rm4 = st.columns(4)
+            rm1.metric("Facturación proyectada", fmt_currency(_renta["facturacion"]))
+            rm2.metric("Neto MP (×0,81)", fmt_currency(_renta["neto_mp"]))
+            rm3.metric("Renta neta", fmt_currency(_renta["renta"]),
+                       delta=f"{_renta['margen_pct']:.1f}% margen")
+            rm4.metric("Envíos ME2 (mes)", fmt_currency(_renta["envios"]))
+            _comp = pd.DataFrame({
+                "Concepto": ["Costo mercadería", "Comisión+imp.", "Publicidad", "Envíos", "Renta neta"],
+                "Monto":    [_renta["cogs"], _renta["comision_imp"], _renta["ads"],
+                             _renta["envios"], _renta["renta"]],
+            })
+            _figr = px.bar(_comp, x="Concepto", y="Monto", color="Concepto",
+                           color_discrete_sequence=["#3483FA", "#FFC043", "#9B8CFF", "#FF6B6B", "#14b47c"])
+            _figr.update_layout(height=300, showlegend=False, yaxis_title="UYU",
+                                xaxis_title=None, xaxis_tickangle=-15)
+            st.plotly_chart(_figr, use_container_width=True)
+            st.caption(
+                f"COGS/facturación {_renta['cogs_ratio_pct']:.0f}% (sobre {_renta['n_items_match']} de "
+                f"{_renta['n_items_total']} ítems matcheados con el listado de costos). "
+                f"Envíos del mes a hoy: {fmt_currency(_renta['envios_sofar'])}. "
+                f"Montos netos y proyectados a fin de mes."
+            )
+            if _renta["match_coverage_pct"] < 60:
+                st.info("ℹ️ Cobertura de costeo parcial: el COGS se estima con el margen de los ítems "
+                        "que matchean con el listado. A mayor cobertura, más preciso el número.")
 
     # ── Backtest AUTOMÁTICO + optimización de pesos MANUAL ────────
     st.markdown("---")
