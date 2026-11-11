@@ -626,10 +626,42 @@ class MySalesExtractor:
         _default_w = [0.05, 0.10, 0.20, 0.05, 0.05, 0.10, 0.10, 0.20, 0.15]
         wv = _default_w
         if weights_by_bucket:
-            bucket = "early" if days_elapsed <= 10 else ("mid" if days_elapsed <= 20 else "late")
-            cand = weights_by_bucket.get(bucket) or weights_by_bucket.get("all")
-            if cand and len(cand) == 9 and abs(sum(cand) - 1.0) < 0.05:
-                wv = list(cand)
+            # FIX: antes había un corte DURO entre fases (early ≤10, mid ≤20,
+            # late >20): al pasar de día 10 a 11 (o 20 a 21) el vector de pesos
+            # cambiaba de golpe y el ensemble pegaba un salto artificial de
+            # varios millones sin que cambiaran las ventas reales. Ahora los
+            # pesos se INTERPOLAN de forma continua entre las anclas de cada
+            # fase (centro de su tramo: día 5.5 / 15.5 / 25.5), así el
+            # pronóstico se mueve suave y no hay escalones en los bordes.
+            def _valid(c):
+                return list(c) if (c and len(c) == 9 and abs(sum(c) - 1.0) < 0.05) else None
+            anchors = []  # (día ancla, vector) ordenadas por día
+            for name, d_anchor in (("early", 5.5), ("mid", 15.5), ("late", 25.5)):
+                v = _valid(weights_by_bucket.get(name))
+                if v:
+                    anchors.append((d_anchor, v))
+            if len(anchors) >= 2:
+                d = days_elapsed
+                if d <= anchors[0][0]:
+                    wv = list(anchors[0][1])
+                elif d >= anchors[-1][0]:
+                    wv = list(anchors[-1][1])
+                else:
+                    for (d0, w0), (d1, w1) in zip(anchors, anchors[1:]):
+                        if d0 <= d <= d1:
+                            t  = (d - d0) / (d1 - d0)
+                            wv = [a * (1 - t) + b * t for a, b in zip(w0, w1)]
+                            break
+            elif anchors:                       # una sola fase definida
+                wv = list(anchors[0][1])
+            else:                               # fallback: vector "all" si existe
+                v_all = _valid(weights_by_bucket.get("all"))
+                if v_all:
+                    wv = v_all
+        # Normalizar por las dudas (la interpolación conserva la suma, pero
+        # si alguna fase viniera sin normalizar, esto la deja en 1.0).
+        _sw = sum(wv) or 1.0
+        wv = [w / _sw for w in wv]
         w1, w2, w3, w4, w5, w6, w7, w8, w9 = wv
         forecast_revenue = (proj1_revenue * w1) + (proj2_revenue * w2) + (proj3_revenue * w3) + (proj4_revenue * w4) + (proj5_revenue * w5) + (proj6_revenue * w6) + (proj7_revenue * w7) + (proj8_revenue * w8) + (proj9_revenue * w9)
         forecast_units   = (proj1_units   * w1) + (proj2_units   * w2) + (proj3_units   * w3) + (proj4_units   * w4) + (proj5_units   * w5) + (proj6_units   * w6) + (proj7_units   * w7) + (proj8_units   * w8) + (proj9_units   * w9)
