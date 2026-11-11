@@ -29,6 +29,7 @@ import time
 import logging
 import unicodedata
 from datetime import date, datetime
+from concurrent.futures import ThreadPoolExecutor
 
 import pandas as pd
 
@@ -134,6 +135,26 @@ class RentaCalculator:
             return float(best["costo_usd"]), str(best["codigo"])
         return None, None
 
+    # ─── Envíos en paralelo ───────────────────────────────────────────
+
+    def _fetch_shipping_costs(self, shipping_ids, workers: int = 8) -> dict:
+        """Trae el costo de envío del vendedor para muchos shipping_id EN
+        PARALELO (reutiliza _seller_shipping_cost de MySalesExtractor, que ya
+        aplica la regla ME2-gratis→list_cost). Baja ~750 envíos de ~5 min a
+        ~30 s. requests.Session es thread-safe para requests independientes."""
+        if not shipping_ids:
+            return {}
+        def _one(sid):
+            try:
+                return sid, self.sales._seller_shipping_cost(sid)
+            except Exception:
+                return sid, 0.0
+        out = {}
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            for sid, cost in ex.map(_one, shipping_ids):
+                out[sid] = cost
+        return out
+
     # ─── Parámetros (TC, ADS) persistidos en Dropbox ──────────────────
 
     def load_params(self) -> dict:
@@ -166,8 +187,9 @@ class RentaCalculator:
         rev_sofar = float(forecast["revenue_so_far"]) or 1.0
         d_elapsed = int(forecast["days_elapsed"])
 
-        # Ventas del mes a la fecha, a nivel ítem, CON envíos (1 sola pasada).
-        df = self.sales.get_orders(days_back=d_elapsed + 1, with_shipping=True)
+        # Ventas del mes a la fecha, a nivel ítem. SIN envíos acá (los traigo
+        # en paralelo más abajo: recorrer ~750 envíos secuencial tardaba ~5 min).
+        df = self.sales.get_orders(days_back=d_elapsed + 1, with_shipping=False)
         if df is None or df.empty:
             return {"error": "sin ventas del mes para costear"}
         df = df[df["status"] == "paid"].copy()
@@ -202,8 +224,12 @@ class RentaCalculator:
         coverage = rev_matched / rev_total if rev_total > 0 else 0.0
         cogs_ratio = cogs_matched / rev_matched if rev_matched > 0 else 0.0
 
-        # Envíos a la fecha (shipping_cost ya viene 1 vez por orden).
-        envios_sofar = float(df["shipping_cost"].sum())
+        # Envíos a la fecha: 1 consulta /shipments por ORDEN (shipping_id único
+        # por orden), traídas EN PARALELO. Cada sid mapea a una orden, así que
+        # el total es la suma directa de los costos por envío.
+        _sids = [s for s in df["shipping_id"].dropna().unique().tolist() if s]
+        _ship_map = self._fetch_shipping_costs(_sids)
+        envios_sofar = float(sum(_ship_map.values()))
 
         # Proyección a fin de mes (escala por facturación).
         scale = fact_proy / rev_sofar if rev_sofar > 0 else 1.0
