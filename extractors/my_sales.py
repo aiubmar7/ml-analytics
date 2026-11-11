@@ -70,7 +70,9 @@ class MySalesExtractor:
             return _cached[1]
 
         user_id   = self._get_user_id()
-        date_from = (datetime.now() - timedelta(days=days_back)).strftime("%Y-%m-%dT00:00:00.000-03:00")
+        # Hora local de Uruguay (el server corre en UTC): antes usaba
+        # datetime.now() naive y etiquetaba -03:00, corriendo la ventana 3h.
+        date_from = (datetime.now(UY_TZ) - timedelta(days=days_back)).strftime("%Y-%m-%dT00:00:00.000-03:00")
         logger.info(f"Extrayendo ordenes de los ultimos {days_back} dias...")
         orders = []
         for order in self.client.get_all_pages(
@@ -252,6 +254,49 @@ class MySalesExtractor:
             return df
         except Exception:
             return None
+
+    # Pesos base del ensemble (9 factores). Única definición.
+    _BASE_W = [0.05, 0.10, 0.20, 0.05, 0.05, 0.10, 0.10, 0.20, 0.15]
+
+    @staticmethod
+    def _interp_weights(days_elapsed, weights_by_bucket, default_w=None):
+        """Vector de pesos para un día del mes, interpolado de forma CONTINUA
+        entre las anclas de cada fase (centro de su tramo: 5.5 / 15.5 / 25.5).
+        ÚNICA fuente de verdad: la usan tanto producción (get_monthly_forecast)
+        como el backtest/optimizador, de modo que el backtest mide exactamente
+        lo que corre y no hay escalones en los bordes de fase (que antes
+        causaban saltos de millones de un día al otro)."""
+        if default_w is None:
+            default_w = MySalesExtractor._BASE_W
+        def _valid(c):
+            return list(c) if (c and len(c) == 9 and abs(sum(c) - 1.0) < 0.05) else None
+        wv = None
+        if weights_by_bucket:
+            anchors = []
+            for name, d_anchor in (("early", 5.5), ("mid", 15.5), ("late", 25.5)):
+                v = _valid(weights_by_bucket.get(name))
+                if v:
+                    anchors.append((d_anchor, v))
+            if len(anchors) >= 2:
+                d = days_elapsed
+                if d <= anchors[0][0]:
+                    wv = list(anchors[0][1])
+                elif d >= anchors[-1][0]:
+                    wv = list(anchors[-1][1])
+                else:
+                    for (d0, w0), (d1, w1) in zip(anchors, anchors[1:]):
+                        if d0 <= d <= d1:
+                            t  = (d - d0) / (d1 - d0)
+                            wv = [a * (1 - t) + b * t for a, b in zip(w0, w1)]
+                            break
+            elif anchors:
+                wv = list(anchors[0][1])
+            else:
+                wv = _valid(weights_by_bucket.get("all"))
+        if wv is None:
+            wv = list(default_w)
+        s = sum(wv) or 1.0
+        return [w / s for w in wv]
 
     def get_monthly_forecast(self, as_of=None, data_override=None, weights_by_bucket=None) -> dict:
         # as_of / data_override permiten re-correr el MISMO cálculo para una
@@ -623,45 +668,9 @@ class MySalesExtractor:
         # Pesos: por defecto los base. Si viene weights_by_bucket, elige por
         # fase del mes (temprano ≤10, medio ≤20, tarde >20) — esto habilita
         # D (pesos que varían con el día) y C (optimizados por el backtest).
-        _default_w = [0.05, 0.10, 0.20, 0.05, 0.05, 0.10, 0.10, 0.20, 0.15]
-        wv = _default_w
-        if weights_by_bucket:
-            # FIX: antes había un corte DURO entre fases (early ≤10, mid ≤20,
-            # late >20): al pasar de día 10 a 11 (o 20 a 21) el vector de pesos
-            # cambiaba de golpe y el ensemble pegaba un salto artificial de
-            # varios millones sin que cambiaran las ventas reales. Ahora los
-            # pesos se INTERPOLAN de forma continua entre las anclas de cada
-            # fase (centro de su tramo: día 5.5 / 15.5 / 25.5), así el
-            # pronóstico se mueve suave y no hay escalones en los bordes.
-            def _valid(c):
-                return list(c) if (c and len(c) == 9 and abs(sum(c) - 1.0) < 0.05) else None
-            anchors = []  # (día ancla, vector) ordenadas por día
-            for name, d_anchor in (("early", 5.5), ("mid", 15.5), ("late", 25.5)):
-                v = _valid(weights_by_bucket.get(name))
-                if v:
-                    anchors.append((d_anchor, v))
-            if len(anchors) >= 2:
-                d = days_elapsed
-                if d <= anchors[0][0]:
-                    wv = list(anchors[0][1])
-                elif d >= anchors[-1][0]:
-                    wv = list(anchors[-1][1])
-                else:
-                    for (d0, w0), (d1, w1) in zip(anchors, anchors[1:]):
-                        if d0 <= d <= d1:
-                            t  = (d - d0) / (d1 - d0)
-                            wv = [a * (1 - t) + b * t for a, b in zip(w0, w1)]
-                            break
-            elif anchors:                       # una sola fase definida
-                wv = list(anchors[0][1])
-            else:                               # fallback: vector "all" si existe
-                v_all = _valid(weights_by_bucket.get("all"))
-                if v_all:
-                    wv = v_all
-        # Normalizar por las dudas (la interpolación conserva la suma, pero
-        # si alguna fase viniera sin normalizar, esto la deja en 1.0).
-        _sw = sum(wv) or 1.0
-        wv = [w / _sw for w in wv]
+        # Pesos interpolados de forma continua por día de mes (mismo helper
+        # que usa el backtest, así no se desincronizan). Ver _interp_weights.
+        wv = self._interp_weights(days_elapsed, weights_by_bucket, self._BASE_W)
         w1, w2, w3, w4, w5, w6, w7, w8, w9 = wv
         forecast_revenue = (proj1_revenue * w1) + (proj2_revenue * w2) + (proj3_revenue * w3) + (proj4_revenue * w4) + (proj5_revenue * w5) + (proj6_revenue * w6) + (proj7_revenue * w7) + (proj8_revenue * w8) + (proj9_revenue * w9)
         forecast_units   = (proj1_units   * w1) + (proj2_units   * w2) + (proj3_units   * w3) + (proj4_units   * w4) + (proj5_units   * w5) + (proj6_units   * w6) + (proj7_units   * w7) + (proj8_units   * w8) + (proj9_units   * w9)
@@ -897,18 +906,57 @@ class MySalesExtractor:
         }
 
     @staticmethod
+    def _round_w(w):
+        """Redondea un vector de pesos a 3 decimales y absorbe el residuo de
+        redondeo en el componente mayor, para que la suma dé exactamente 1.0."""
+        r = [round(float(x), 3) for x in w]
+        resid = round(1.0 - sum(r), 3)
+        if resid:
+            k = max(range(len(r)), key=lambda i: r[i])
+            r[k] = round(r[k] + resid, 3)
+        return r
+
+    @staticmethod
+    def _phase_mix(day):
+        """Mezcla (early, mid, late) que le toca a un día, con las MISMAS
+        anclas que _interp_weights (5.5 / 15.5 / 25.5). Así el backtest aplica
+        exactamente el mismo peso interpolado que producción."""
+        if day <= 5.5:
+            return [1.0, 0.0, 0.0]
+        if day >= 25.5:
+            return [0.0, 0.0, 1.0]
+        if day <= 15.5:
+            t = (day - 5.5) / 10.0
+            return [1.0 - t, t, 0.0]
+        t = (day - 15.5) / 10.0
+        return [0.0, 1.0 - t, t]
+
+    @staticmethod
+    def _mape_interp(W3, M, P, actual, day, dim):
+        """MAPE del ensemble + Factor 10 aplicando a cada muestra el vector de
+        pesos INTERPOLADO por su día (mezcla M de las 3 anclas W3). Vectorizado
+        y equivalente a lo que corre producción."""
+        import numpy as np
+        Wn   = M.dot(W3)                              # (N,9) peso efectivo por muestra
+        ens  = np.einsum("ij,ij->i", Wn, P)          # ensemble por muestra
+        tgt  = (P[:, 2] + P[:, 7] + P[:, 8]) / 3.0    # F10 target = prom(F3,F8,F9)
+        lam  = np.clip((1.0 - day / dim) * 0.5, 0.0, 0.5)
+        pred = ens * (1.0 - lam) + tgt * lam
+        return float(np.mean(np.abs(pred - actual) / actual))
+
+    @staticmethod
     def _mape_of_weights(w, subset):
-        """MAPE de un vector de pesos sobre un subconjunto de muestras,
-        replicando el ensemble + Factor 10 tal como producción."""
+        """MAPE de un ÚNICO vector plano (sin interpolar) sobre un subconjunto.
+        Se conserva para evaluaciones puntuales/compatibilidad."""
         import numpy as np
         if not subset:
             return None
         errs = []
         for s in subset:
-            p   = s["p"]
-            ens = float(np.dot(w, p))
-            tgt = (p[2] + p[7] + p[8]) / 3.0                       # F10 target = prom(F3,F8,F9)
-            lam = max(0.0, min(0.5, (1.0 - s["day"] / s["dim"]) * 0.5))
+            p    = s["p"]
+            ens  = float(np.dot(w, p))
+            tgt  = (p[2] + p[7] + p[8]) / 3.0
+            lam  = max(0.0, min(0.5, (1.0 - s["day"] / s["dim"]) * 0.5))
             pred = ens * (1 - lam) + tgt * lam
             errs.append(abs(pred - s["actual"]) / s["actual"])
         return float(np.mean(errs))
@@ -922,47 +970,65 @@ class MySalesExtractor:
         import numpy as np
         if not samples:
             return {}
-        base = np.array([0.05, 0.10, 0.20, 0.05, 0.05, 0.10, 0.10, 0.20, 0.15])
+        base = np.array(self._BASE_W, dtype=float)
 
-        def optimize(subset):
-            if len(subset) < 3:                                    # muy pocas muestras: no optimizar
-                return None, None
-            w    = base.copy()
-            best = self._mape_of_weights(w, subset)
-            step = 0.05
-            for _ in range(300):
-                improved = False
+        # Matrices: mezcla de fase por muestra (N,3), proyecciones (N,9),
+        # reales / día / dim. La mezcla usa las mismas anclas que producción.
+        M      = np.array([self._phase_mix(s["day"]) for s in samples], dtype=float)
+        P      = np.array([s["p"] for s in samples], dtype=float)
+        actual = np.array([s["actual"] for s in samples], dtype=float)
+        day    = np.array([float(s["day"]) for s in samples], dtype=float)
+        dim    = np.array([float(s["dim"]) for s in samples], dtype=float)
+
+        def mape(W3m, mask=None):
+            if mask is None:
+                return self._mape_interp(W3m, M, P, actual, day, dim)
+            if not mask.any():
+                return None
+            return self._mape_interp(W3m, M[mask], P[mask], actual[mask], day[mask], dim[mask])
+
+        # Coordinate descent CONJUNTO sobre las 3 anclas (early/mid/late = 3x9
+        # parámetros), evaluando con el peso INTERPOLADO por día. Así optimiza
+        # exactamente lo que corre producción (antes optimizaba cada fase con
+        # corte duro y se desincronizaba del pronóstico real).
+        W3   = np.vstack([base.copy(), base.copy(), base.copy()])   # (3,9)
+        best = mape(W3)
+        step = 0.05
+        for _ in range(300):
+            improved = False
+            for r in range(3):
                 for i in range(9):
                     for j in range(9):
-                        if i == j or w[i] - step < 0:
+                        if i == j or W3[r, i] - step < 0:
                             continue
-                        cand = w.copy(); cand[i] -= step; cand[j] += step
-                        mp = self._mape_of_weights(cand, subset)
+                        cand = W3.copy()
+                        cand[r, i] -= step
+                        cand[r, j] += step
+                        mp = mape(cand)
                         if mp is not None and mp < best - 1e-9:
-                            w, best, improved = cand, mp, True
-                if not improved:
-                    step /= 2.0
-                    if step < 0.01:
-                        break
-            return w, best
+                            W3, best, improved = cand, mp, True
+            if not improved:
+                step /= 2.0
+                if step < 0.01:
+                    break
 
-        out = {"weights_by_bucket": {}, "mape_by_bucket": {}}
-        groups = {
-            "early": [s for s in samples if s["day"] <= 10],
-            "mid":   [s for s in samples if 10 < s["day"] <= 20],
-            "late":  [s for s in samples if s["day"] > 20],
+        base3 = np.vstack([base, base, base])
+        masks = {
+            "early": day <= 10,
+            "mid":   (day > 10) & (day <= 20),
+            "late":  day > 20,
         }
-        for name, sub in groups.items():
-            w, mp = optimize(sub)
-            if w is not None:
-                out["weights_by_bucket"][name] = [round(float(x), 3) for x in w]
+        out = {"weights_by_bucket": {}, "mape_by_bucket": {}}
+        for r, name in enumerate(["early", "mid", "late"]):
+            out["weights_by_bucket"][name] = self._round_w(W3[r])
+            msk = masks[name]
+            if int(msk.sum()) > 0:
                 out["mape_by_bucket"][name] = {
-                    "base": round(self._mape_of_weights(base, sub) * 100, 1),
-                    "opt":  round(mp * 100, 1),
-                    "n":    len(sub),
+                    "base": round(mape(base3, msk) * 100, 1),
+                    "opt":  round(mape(W3,    msk) * 100, 1),
+                    "n":    int(msk.sum()),
                 }
-        wg, mpg = optimize(samples)
-        out["weights_global"]    = [round(float(x), 3) for x in wg] if wg is not None else None
-        out["mape_global_base"]  = round(self._mape_of_weights(base, samples) * 100, 1)
-        out["mape_global_opt"]   = round(mpg * 100, 1) if mpg else None
+        out["weights_global"]    = None
+        out["mape_global_base"]  = round(mape(base3) * 100, 1)
+        out["mape_global_opt"]   = round(best * 100, 1)
         return out

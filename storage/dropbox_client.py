@@ -170,7 +170,12 @@ class DropboxClient:
         full_path = self._full_path(relative_folder)
         try:
             result = self.dbx.files_list_folder(full_path)
-            return [entry.name for entry in result.entries]
+            names  = [entry.name for entry in result.entries]
+            # Paginar: files_list_folder devuelve máx 2000 por página.
+            while getattr(result, "has_more", False):
+                result = self.dbx.files_list_folder_continue(result.cursor)
+                names.extend(entry.name for entry in result.entries)
+            return names
         except ApiError as e:
             if "not_found" in str(e):
                 return []

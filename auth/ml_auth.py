@@ -185,8 +185,25 @@ def get_valid_access_token() -> str:
         )
 
     # 4. Refrescar y persistir (auto-renovación).
-    tokens = refresh_access_token(refresh_token)
-    return tokens["access_token"]
+    try:
+        tokens = refresh_access_token(refresh_token)
+        return tokens["access_token"]
+    except Exception as e:
+        # Posible CARRERA: los refresh tokens de ML son de un solo uso (rotan).
+        # Si otro proceso/rerun refrescó con el MISMO token justo antes, este
+        # queda invalidado y ML devuelve invalid_grant. En vez de tirar la app,
+        # re-leemos Dropbox (la otra corrida ya pudo dejar un token fresco) y,
+        # si trae un refresh distinto, reintentamos una sola vez.
+        logger.warning(f"Refresh de token falló ({e}); reintentando desde Dropbox...")
+        tokens2 = _load_tokens_dropbox()
+        if _is_fresh(tokens2):
+            _mem_tokens = tokens2
+            return tokens2["access_token"]
+        rt2 = (tokens2 or {}).get("refresh_token")
+        if rt2 and rt2 != refresh_token:
+            tokens3 = refresh_access_token(rt2)
+            return tokens3["access_token"]
+        raise
 
 
 def authorize_interactive():
