@@ -644,6 +644,36 @@ if page == "🏠 Resumen":
         if abs(_tc - _rp["tc"]) > 1e-6 or abs(_ads - _rp["ads"]) > 0.5:
             rc.save_params(_tc, _ads)
 
+        # Cargador del listado de costos: lo guarda en Dropbox con la conexión
+        # de la app (no depende del sync del Dropbox de escritorio).
+        with st.expander("⚙️ Actualizar listado de costos (FacturApp → Dropbox)"):
+            st.caption("Subí el listado de stock/costos exportado de FacturApp (CSV, Excel o parquet). "
+                       "Se detectan solas las columnas de **código** y **costo de compra**, y se guarda "
+                       "en Dropbox para el costeo por SKU. Reemplaza el listado anterior.")
+            _up = st.file_uploader("Archivo de costos", type=["csv", "xlsx", "xls", "parquet"],
+                                   key="costos_uploader")
+            if _up is not None and st.button("💾 Guardar listado en Dropbox", type="secondary"):
+                try:
+                    _name = _up.name.lower()
+                    if _name.endswith(".parquet"):
+                        _raw = pd.read_parquet(_up)
+                    elif _name.endswith((".xlsx", ".xls")):
+                        _raw = pd.read_excel(_up)
+                    else:
+                        _raw = pd.read_csv(_up, sep=None, engine="python")
+                    _n, _msg = rc.save_cost_list(_raw)
+                    if _n > 0:
+                        try:
+                            clients["storage"].save_json(
+                                {"ts": 0, "result": {}}, "config/renta_cache.json")  # invalida cache
+                        except Exception:
+                            pass
+                        st.success(f"✅ {_msg} Volvé a tocar **Calcular / actualizar renta**.")
+                    else:
+                        st.error(f"⚠️ {_msg}")
+                except Exception as _e:
+                    st.error(f"No pude leer el archivo: {_e}")
+
         _bcol, _acol = st.columns([1, 2])
         with _bcol:
             _recalc = st.button("🔄 Calcular / actualizar renta", type="secondary",

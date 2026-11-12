@@ -25,6 +25,7 @@ Datos sensibles: el listado de costos vive SOLO en Dropbox privado
 (data/costos/costos.parquet), nunca en el repo público.
 """
 
+import re
 import logging
 from datetime import date, datetime
 from concurrent.futures import ThreadPoolExecutor
@@ -56,6 +57,32 @@ def _norm_code(x) -> str:
         s = s.lstrip("0") or "0"
     return s
 
+def _parse_money(x) -> float:
+    """Convierte un valor de costo a float. Tolera 'U$S 274,00', '$1.234,56'
+    (formato UY: . miles , decimal), '274.00' (US) y números planos."""
+    if x is None:
+        return 0.0
+    if isinstance(x, (int, float)):
+        try:
+            return float(x)
+        except Exception:
+            return 0.0
+    s = re.sub(r"[^\d.,-]", "", str(x))
+    if not s:
+        return 0.0
+    if "." in s and "," in s:
+        # el último separador es el decimal
+        if s.rfind(".") > s.rfind(","):
+            s = s.replace(",", "")                       # '.' decimal (US)
+        else:
+            s = s.replace(".", "").replace(",", ".")     # ',' decimal (UY)
+    elif "," in s:
+        s = s.replace(",", ".") if len(s.split(",")[-1]) in (1, 2) else s.replace(",", "")
+    try:
+        return float(s)
+    except Exception:
+        return 0.0
+
 
 class RentaCalculator:
     def __init__(self, sales_extractor, storage):
@@ -84,6 +111,36 @@ class RentaCalculator:
                               "descripcion": str(r["descripcion"])}
         self._cost_df, self._cost_by_code = df, by_code
         return df
+
+    def save_cost_list(self, raw: "pd.DataFrame") -> tuple:
+        """Normaliza y guarda un listado de costos subido por el usuario
+        (CSV/Excel/parquet de FacturApp) a Dropbox, con la conexión de la app
+        (no depende del sync del Dropbox de escritorio). Detecta solo las
+        columnas de código y costo. Devuelve (n_filas, mensaje)."""
+        if raw is None or raw.empty:
+            return 0, "El archivo vino vacío."
+        cols = {str(c).lower().strip(): c for c in raw.columns}
+        def _find(*subs):
+            for low, orig in cols.items():
+                if any(s in low for s in subs):
+                    return orig
+            return None
+        cod_col  = _find("codigo", "código", "sku", "cod ", "cod.") or cols.get("cod") or cols.get("codigo")
+        cost_col = _find("compra") or _find("costo_usd", "costo", "precio costo") or _find("precio")
+        desc_col = _find("descrip", "nombre", "articulo", "artículo", "detalle", "producto")
+        if not cod_col or not cost_col:
+            return 0, (f"No pude detectar las columnas. Vi: {list(raw.columns)}. "
+                       "Necesito una columna de código y una de costo/precio de compra.")
+        out = pd.DataFrame()
+        out["codigo"]      = raw[cod_col].map(_norm_code)
+        out["descripcion"] = raw[desc_col].astype(str) if desc_col else ""
+        out["costo_usd"]   = raw[cost_col].map(_parse_money)
+        out = out[(out["codigo"] != "") & (out["costo_usd"] > 0)].drop_duplicates("codigo", keep="last")
+        if out.empty:
+            return 0, f"Detecté columnas ({cod_col} / {cost_col}) pero no quedaron filas con costo > 0."
+        self.storage.save_dataframe(out[["codigo", "descripcion", "costo_usd"]], COST_LIST_PATH)
+        self._cost_df = None; self._cost_by_code = None   # invalidar cache en memoria
+        return len(out), f"Guardados {len(out)} costos en Dropbox (columnas: {cod_col} → {cost_col})."
 
     def cost_for_sku(self, seller_sku, seller_custom_field=None):
         """Costo USD por LLAVE EXACTA de SKU (código interno). Prueba
