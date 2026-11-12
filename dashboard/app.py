@@ -755,6 +755,16 @@ if page == "🏠 Resumen":
                     st.caption("Margen real = venta − costo real − **envío ME2 que pagás vos** "
                                "+ **ganancia de envío ME1** (comprador paga, vos despachás más barato). "
                                "Si un SKU da margen muy bajo o negativo, revisá su costo o su envío.")
+            _falta = _renta.get("diag_falta") or []
+            if _falta:
+                with st.expander(f"🚨 SKU vendidos SIN costo (top 15) — esto baja la cobertura"):
+                    st.caption("Estos SKU se vendieron pero NO están en el listado de costos (agotados, "
+                               "nuevos, o con código distinto). Son los que bajan la cobertura. "
+                               "Agregalos al listado de FacturApp (con su costo) y re-subilo.")
+                    _fdf = pd.DataFrame(_falta).rename(columns={
+                        "sku": "SKU", "item": "Producto", "un": "Unid.", "rev": "Facturación"})
+                    st.dataframe(_fdf[["SKU", "Producto", "Unid.", "Facturación"]],
+                                 use_container_width=True, hide_index=True)
 
     # ── Backtest AUTOMÁTICO + optimización de pesos MANUAL ────────
     st.markdown("---")

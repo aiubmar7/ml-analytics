@@ -293,6 +293,22 @@ class RentaCalculator:
                     "un": int(r["un"]),
                 })
 
+        # Diagnóstico de FALTANTES: SKU que se venden pero NO tienen costo en el
+        # listado (son los que bajan la cobertura). Muestra el SKU para cargarlo.
+        _diag_falta = []
+        _un = df[~df["matched"]]
+        if not _un.empty:
+            _skc = _un["seller_sku"].fillna(_un.get("seller_custom_field"))
+            gu = (_un.assign(_sku=_skc.astype(str))
+                     .groupby(["_sku", "item_title"], as_index=False)
+                     .agg(rev=("rev_item", "sum"), un=("quantity", "sum")))
+            gu = gu.sort_values("rev", ascending=False).head(15)
+            for _, r in gu.iterrows():
+                _diag_falta.append({
+                    "sku": str(r["_sku"]), "item": str(r["item_title"])[:60],
+                    "rev": round(float(r["rev"])), "un": int(r["un"]),
+                })
+
         # Proyección a fin de mes (escala por facturación).
         scale = fact_proy / rev_sofar if rev_sofar > 0 else 1.0
         neto_mp   = fact_proy * NETO_MP_RATE
@@ -331,6 +347,7 @@ class RentaCalculator:
             "cost_list_n":      n_cost_codes,
             "reliable":         bool(n_cost_codes > 0 and coverage >= 0.5),
             "diagnostico":      _diag,
+            "diag_falta":       _diag_falta,
             "computed_at":      datetime.now().isoformat(),
         }
 
