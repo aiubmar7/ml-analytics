@@ -59,6 +59,19 @@ def _norm(s: str) -> str:
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
+def _norm_code(x) -> str:
+    """Normaliza un código interno / SKU para matchear exacto: str, sin
+    espacios, minúsculas; a los numéricos les saca ceros a la izquierda
+    (08189 == 8189)."""
+    if x is None:
+        return ""
+    s = str(x).strip().lower()
+    if s in ("", "nan", "none"):
+        return ""
+    if s.isdigit():
+        s = s.lstrip("0") or "0"
+    return s
+
 _STOP = {"de","la","el","con","para","y","en","a","2","1","cm","cms","un","una",
          "x","color","blanco","negro","gris","uni","mm","lt","lts","w"}
 
@@ -101,7 +114,8 @@ class RentaCalculator:
         self.sales   = sales_extractor
         self.storage = storage
         self._cost_df = None
-        self._cost_idx = None     # token -> set(row_pos)
+        self._cost_idx = None     # token -> set(row_pos)  (match por título, fallback)
+        self._cost_by_code = None # código interno -> {costo_usd, descripcion} (llave exacta)
 
     # ─── Listado de costos ────────────────────────────────────────────
 
@@ -117,14 +131,33 @@ class RentaCalculator:
         df["_keys"]   = df["_norm"].map(_key_tokens)
         df["_strong"] = df["_norm"].map(_strong_tokens)
         df["_toks"]   = df["_norm"].map(_all_tokens)
-        # índice invertido por token FUERTE: el candidato debe compartir un
-        # código de modelo / nro de parte, no un simple "12k".
+        # índice invertido por token FUERTE (match por título, sólo fallback).
         idx = {}
         for pos, strong in enumerate(df["_strong"]):
             for k in strong:
                 idx.setdefault(k, set()).add(pos)
-        self._cost_df, self._cost_idx = df, idx
+        # LLAVE EXACTA: código interno -> costo. En ML cada venta trae ese
+        # código en seller_sku, así que el costeo es costo real × venta real.
+        by_code = {}
+        for _, r in df.iterrows():
+            k = _norm_code(r["codigo"])
+            if k:
+                by_code[k] = {"costo_usd": float(r["costo_usd"]),
+                              "descripcion": str(r["descripcion"])}
+        self._cost_df, self._cost_idx, self._cost_by_code = df, idx, by_code
         return df
+
+    def cost_for_sku(self, seller_sku, seller_custom_field=None):
+        """Costo USD por LLAVE EXACTA de SKU (código interno). Prueba
+        seller_sku y, si no, seller_custom_field. Devuelve (costo_usd, codigo)
+        o (None, None)."""
+        self.load_cost_list()
+        by = self._cost_by_code or {}
+        for raw in (seller_sku, seller_custom_field):
+            k = _norm_code(raw)
+            if k and k in by:
+                return by[k]["costo_usd"], k
+        return None, None
 
     def match_cost(self, item_title: str):
         """Devuelve (costo_usd, codigo) del mejor match, o (None, None).
@@ -230,55 +263,48 @@ class RentaCalculator:
         if df.empty:
             return {"error": "sin ventas pagas del mes"}
 
-        # Facturación a nivel ítem (unit_price × quantity) para el ratio.
+        # Facturación a nivel ítem (unit_price × quantity).
         df["rev_item"] = df["unit_price"] * df["quantity"]
 
-        # Match de costos (cacheado por título para no repetir).
-        cache = {}
-        def _cost(t):
-            if t not in cache:
-                cache[t] = self.match_cost(t)
-            return cache[t]
+        # COSTEO POR LLAVE EXACTA DE SKU: código interno (seller_sku) ↔ listado.
+        # Margen real = costo real × precio real de venta, SKU por SKU.
+        self.load_cost_list()
+        _sku_col = df["seller_sku"] if "seller_sku" in df.columns else [None] * len(df)
+        _cf_col  = df["seller_custom_field"] if "seller_custom_field" in df.columns else [None] * len(df)
         costos, matched, codes = [], [], []
-        for t, q, up in zip(df["item_title"], df["quantity"], df["unit_price"]):
-            c, cod = _cost(t)
-            rev_i = float(up) * float(q)
+        for sku, cf, q in zip(_sku_col, _cf_col, df["quantity"]):
+            c, cod = self.cost_for_sku(sku, cf)
             if c is None:
                 costos.append(0.0); matched.append(False); codes.append(None)
-                continue
-            cogs_i = c * q * tc                      # COGS del ítem en UYU
-            # GUARDIA: si el costo supera a la venta, es casi seguro un mal
-            # match (no se vende a pérdida) → no lo contamos: ni infla el COGS
-            # ni suma como cubierto.
-            if cogs_i > rev_i * 1.05:
-                costos.append(0.0); matched.append(False); codes.append(None)
             else:
-                costos.append(cogs_i); matched.append(True); codes.append(cod)
+                costos.append(c * float(q) * tc); matched.append(True); codes.append(cod)
         df["cogs_item"] = costos
         df["matched"]   = matched
         df["cod"]       = codes
 
         rev_total    = float(df["rev_item"].sum())
         rev_matched  = float(df.loc[df["matched"], "rev_item"].sum())
+        rev_unmatch  = rev_total - rev_matched
         cogs_matched = float(df.loc[df["matched"], "cogs_item"].sum())
         coverage   = rev_matched / rev_total if rev_total > 0 else 0.0
-        cogs_ratio = cogs_matched / rev_matched if rev_matched > 0 else 0.0
+        # Ratio COGS real sobre lo matcheado (costo real / venta real).
+        cogs_ratio_real = cogs_matched / rev_matched if rev_matched > 0 else 0.0
 
-        # Diagnóstico: top ítems matcheados por facturación, con su markup real
-        # (para poder auditar la calidad del match).
+        # Diagnóstico: top SKU por facturación con su margen real.
         _diag = []
         if bool(df["matched"].any()):
             g = (df[df["matched"]]
-                 .groupby(["item_title", "cod"], as_index=False)
+                 .groupby(["cod", "item_title"], as_index=False)
                  .agg(rev=("rev_item", "sum"), cogs=("cogs_item", "sum"),
                       un=("quantity", "sum")))
-            g["markup"] = (g["rev"] / g["cogs"] - 1) * 100
-            g = g.sort_values("rev", ascending=False).head(15)
+            g["markup"] = (g["rev"] / g["cogs"].replace(0, float("nan")) - 1) * 100
+            g = g.sort_values("rev", ascending=False).head(20)
             for _, r in g.iterrows():
                 _diag.append({
                     "item": str(r["item_title"])[:60], "cod": r["cod"],
                     "rev": round(float(r["rev"])), "cogs": round(float(r["cogs"])),
-                    "markup_pct": round(float(r["markup"]), 1), "un": int(r["un"]),
+                    "markup_pct": round(float(r["markup"]), 1) if r["cogs"] else None,
+                    "un": int(r["un"]),
                 })
 
         # Envíos a la fecha: 1 consulta /shipments por ORDEN, en PARALELO. Los
@@ -291,10 +317,13 @@ class RentaCalculator:
         # Proyección a fin de mes (escala por facturación).
         scale = fact_proy / rev_sofar if rev_sofar > 0 else 1.0
         neto_mp   = fact_proy * NETO_MP_RATE
-        # COGS de CABECERA: markup promedio (estable). cogs = fact / (1+markup).
-        markup_pct = float(markup_pct or 52.0)
-        cogs_ratio_markup = 1.0 / (1.0 + markup_pct / 100.0)
-        cogs_proy = cogs_ratio_markup * fact_proy
+        # COGS de CABECERA: costo REAL por SKU donde hay cobertura; el markup
+        # (ajustable) sólo rellena la facturación que todavía no tiene SKU
+        # matcheado. Con cobertura 100% es 100% costo real.
+        markup_pct   = float(markup_pct or 52.0)
+        markup_ratio = 1.0 / (1.0 + markup_pct / 100.0)
+        blended_ratio = coverage * cogs_ratio_real + (1 - coverage) * markup_ratio
+        cogs_proy = blended_ratio * fact_proy
         envios_proy = envios_sofar * scale
         ads = float(ads or 0.0)
 
@@ -313,8 +342,8 @@ class RentaCalculator:
             "envios":           round(envios_proy, 2),
             "renta":            round(renta, 2),
             "margen_pct":       round(margen * 100, 1),
-            "cogs_ratio_pct":   round(cogs_ratio_markup * 100, 1),
-            "cogs_ratio_live_pct": round(cogs_ratio * 100, 1),   # match real (diagnóstico)
+            "cogs_ratio_pct":   round(blended_ratio * 100, 1),
+            "cogs_ratio_real_pct": round(cogs_ratio_real * 100, 1),   # costo real s/ cubierto
             "match_coverage_pct": round(coverage * 100, 1),
             "envios_sofar":     round(envios_sofar, 2),
             "rev_sofar":        round(rev_sofar, 2),
@@ -338,13 +367,17 @@ class RentaCalculator:
         neto   = float(r.get("neto_mp", 0.0))
         envios = float(r.get("envios", 0.0))          # ya proyectado
         markup = float(markup or 52.0); ads = float(ads or 0.0)
-        cogs_ratio = 1.0 / (1.0 + markup / 100.0)
-        cogs  = cogs_ratio * fact
+        # COGS mezclado: real por SKU donde hay cobertura, markup para el resto.
+        cov        = float(r.get("match_coverage_pct", 0.0)) / 100.0
+        real_ratio = float(r.get("cogs_ratio_real_pct", 0.0)) / 100.0
+        markup_ratio  = 1.0 / (1.0 + markup / 100.0)
+        blended_ratio = cov * real_ratio + (1 - cov) * markup_ratio
+        cogs  = blended_ratio * fact
         renta = neto - cogs - ads - envios
         r["markup_pct"]     = round(markup, 1)
         r["ads"]            = round(ads, 2)
         r["cogs"]           = round(cogs, 2)
-        r["cogs_ratio_pct"] = round(cogs_ratio * 100, 1)
+        r["cogs_ratio_pct"] = round(blended_ratio * 100, 1)
         r["renta"]          = round(renta, 2)
         r["margen_pct"]     = round((renta / fact * 100) if fact > 0 else 0, 1)
         return r
