@@ -732,15 +732,17 @@ if page == "🏠 Resumen":
                         "mismo margen real medido. Abrí el diagnóstico y pasame esos SKU para afinar.")
             _diag = _renta.get("diagnostico") or []
             if _diag:
-                with st.expander(f"🔎 Costeo real por SKU (top 20) — margen por producto"):
+                with st.expander(f"🔎 Costeo real por SKU (top 20) — margen con envío"):
                     _ddf = pd.DataFrame(_diag).rename(columns={
                         "item": "Producto", "cod": "SKU", "un": "Unid.",
-                        "rev": "Facturación", "cogs": "Costo", "markup_pct": "Markup %"})
-                    st.dataframe(
-                        _ddf[["Producto", "SKU", "Unid.", "Facturación", "Costo", "Markup %"]],
-                        use_container_width=True, hide_index=True)
-                    st.caption("Costo real del listado × venta real. Si algún SKU muestra un margen "
-                               "raro, revisá el costo cargado de ese código.")
+                        "rev": "Facturación", "cogs": "Costo", "ship": "Envío ME2",
+                        "margen_pct": "Margen %"})
+                    _show = [c for c in ["Producto", "SKU", "Unid.", "Facturación", "Costo",
+                                         "Envío ME2", "Margen %"] if c in _ddf.columns]
+                    st.dataframe(_ddf[_show], use_container_width=True, hide_index=True)
+                    st.caption("Margen real = venta − costo real − **envío ME2 que pagás vos** "
+                               "(0 si el envío lo paga el comprador). Si un SKU da margen muy bajo o "
+                               "negativo, revisá su costo o su política de envío.")
 
     # ── Backtest AUTOMÁTICO + optimización de pesos MANUAL ────────
     st.markdown("---")

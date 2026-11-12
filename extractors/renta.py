@@ -254,29 +254,39 @@ class RentaCalculator:
         # que el panel avise en vez de mostrar una ganancia irreal.
         n_cost_codes = len(self._cost_by_code or {})
 
-        # Diagnóstico: top SKU por facturación con su margen real.
-        _diag = []
-        if bool(df["matched"].any()):
-            g = (df[df["matched"]]
-                 .groupby(["cod", "item_title"], as_index=False)
-                 .agg(rev=("rev_item", "sum"), cogs=("cogs_item", "sum"),
-                      un=("quantity", "sum")))
-            g["markup"] = (g["rev"] / g["cogs"].replace(0, float("nan")) - 1) * 100
-            g = g.sort_values("rev", ascending=False).head(20)
-            for _, r in g.iterrows():
-                _diag.append({
-                    "item": str(r["item_title"])[:60], "cod": r["cod"],
-                    "rev": round(float(r["rev"])), "cogs": round(float(r["cogs"])),
-                    "markup_pct": round(float(r["markup"]), 1) if r["cogs"] else None,
-                    "un": int(r["un"]),
-                })
-
         # Envíos a la fecha: 1 consulta /shipments por ORDEN, en PARALELO. Los
         # shipping_id salen del DataFrame como float (pandas), hay que pasarlos
         # a int o la URL /shipments/123.0 da 404 (bug que ponía envíos en 0).
         _sids = [int(s) for s in df["shipping_id"].dropna().unique().tolist()]
         _ship_map = self._fetch_shipping_costs(_sids)
-        envios_sofar = float(sum(_ship_map.values()))
+        # ATRIBUCIÓN POR SKU: el envío ME2 que paga el vendedor (0 si lo paga el
+        # comprador / ME1) se reparte entre los ítems de la orden por su valor,
+        # para ver el margen REAL de cada SKU con su envío encima.
+        def _ship_of_order(sid):
+            return _ship_map.get(int(sid), 0.0) if pd.notna(sid) else 0.0
+        df["_ship_order"] = df["shipping_id"].map(_ship_of_order)
+        _ord_rev = df.groupby("order_id")["rev_item"].transform("sum").replace(0, float("nan"))
+        df["ship_item"] = (df["_ship_order"] * (df["rev_item"] / _ord_rev)).fillna(0.0)
+        envios_sofar = float(df["ship_item"].sum())
+
+        # Diagnóstico: top SKU por facturación, con costo, envío a tu cargo y
+        # margen real (venta − costo − envío).
+        _diag = []
+        if bool(df["matched"].any()):
+            g = (df[df["matched"]]
+                 .groupby(["cod", "item_title"], as_index=False)
+                 .agg(rev=("rev_item", "sum"), cogs=("cogs_item", "sum"),
+                      ship=("ship_item", "sum"), un=("quantity", "sum")))
+            g = g.sort_values("rev", ascending=False).head(20)
+            for _, r in g.iterrows():
+                _rev = float(r["rev"]); _cg = float(r["cogs"]); _sh = float(r["ship"])
+                _mg = (_rev - _cg - _sh) / _rev * 100 if _rev > 0 else None
+                _diag.append({
+                    "item": str(r["item_title"])[:60], "cod": r["cod"],
+                    "rev": round(_rev), "cogs": round(_cg), "ship": round(_sh),
+                    "margen_pct": round(_mg, 1) if _mg is not None else None,
+                    "un": int(r["un"]),
+                })
 
         # Proyección a fin de mes (escala por facturación).
         scale = fact_proy / rev_sofar if rev_sofar > 0 else 1.0
