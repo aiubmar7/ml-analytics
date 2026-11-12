@@ -659,10 +659,20 @@ if page == "🏠 Resumen":
             st.caption("Todavía no calculaste la renta. Tocá **Calcular / actualizar renta** (una vez).")
         elif "error" in _renta:
             st.caption(f"💵 Renta: {_renta['error']}. Probá **Calcular / actualizar renta**.")
+        elif _renta.get("cost_list_n", 0) == 0:
+            st.error("💵 No encuentro el listado de costos en Dropbox "
+                     "(`data/costos/costos.parquet`). Sin costos no se puede calcular la renta — "
+                     "subí/sincronizá el listado y volvé a calcular.")
         else:
+            _cov0 = _renta['match_coverage_pct']
+            if not _renta.get("reliable", True):
+                st.warning(f"⚠️ Cobertura de SKU **{_cov0:.0f}%** — muy baja para confiar en la renta. "
+                           "La mayoría de las ventas no matchean su costo por SKU (código distinto en "
+                           "ML vs listado, o SKU sin cargar). Mientras tanto el número de abajo es "
+                           "poco fiable; abrí el diagnóstico y pasame los SKU que faltan.")
             with _acol:
                 st.caption(f"Actualizado hace {_age:.0f} h · costeo real por SKU "
-                           f"(cobertura {_renta['match_coverage_pct']:.0f}%) · envíos reales de la API")
+                           f"(cobertura {_cov0:.0f}%) · envíos reales de la API")
             rm1, rm2, rm3, rm4 = st.columns(4)
             rm1.metric("Facturación proyectada", fmt_currency(_renta["facturacion"]))
             rm2.metric("Neto MP (×0,81)", fmt_currency(_renta["neto_mp"]))

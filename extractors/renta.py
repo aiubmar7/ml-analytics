@@ -5,17 +5,18 @@ Fórmula validada con el usuario:
 
     renta = facturación × 0.81  (neto MP: quita 14,1% comisión + ~4,9%
                                  retenciones de impuesto por tarjeta)
-            − COGS              (costo de mercadería, markup real del
-                                 listado de costos, a TC del mes)
+            − COGS              (costo REAL del SKU vs precio REAL de venta)
             − ADS               (inversión en Product Ads del mes)
             − envíos ME2        (list_cost que paga el vendedor en envíos
                                  gratis ME2 drop-off; ME1 y los que paga
                                  el comprador se excluyen)
 
-El COGS del mes PROYECTADO se estima aplicando el ratio COGS/facturación
-medido sobre las ventas reales del mes a la fecha (sobre los ítems
-matcheados con el listado de costos). Se reporta la cobertura del match
-para transparencia.
+COGS automático, SIN markup: cada venta se cruza por el código interno
+(seller_sku de ML ↔ código del listado FacturApp) y se toma el costo real
+del SKU × el precio real al que se vendió. El ratio COGS/facturación real
+medido se extrapola a la facturación proyectada; la cobertura del match se
+reporta y, si es baja o el listado no está, el resultado se marca NO
+confiable (evita mostrar una renta inflada).
 
 Los costos del listado vienen en USD → se convierten a UYU con el TC del
 mes (parámetro, default 40.45).
@@ -24,10 +25,7 @@ Datos sensibles: el listado de costos vive SOLO en Dropbox privado
 (data/costos/costos.parquet), nunca en el repo público.
 """
 
-import re
-import time
 import logging
-import unicodedata
 from datetime import date, datetime
 from concurrent.futures import ThreadPoolExecutor
 
@@ -43,21 +41,7 @@ NETO_MP_RATE = 0.81          # igual a COBRANZA_NET_RATE de my_sales
 DEFAULT_TC   = 40.45         # TC noviembre 2026 (parámetro)
 
 
-# ─── Normalización y matching de títulos ──────────────────────────────
-
-def _strip_accents(s: str) -> str:
-    return "".join(c for c in unicodedata.normalize("NFD", s)
-                   if unicodedata.category(c) != "Mn")
-
-def _norm(s: str) -> str:
-    """minúsculas, sin acentos, BTU unificado (12000->12k), sin ruido."""
-    s = _strip_accents(str(s).lower())
-    s = s.replace("btu", " ").replace("''", " ").replace('"', " ")
-    # 12000 -> 12k ; 9000 -> 9k  (unifica BTU de aires)
-    s = re.sub(r"\b(\d{1,2})000\b", r"\1k", s)
-    s = re.sub(r"[^\w\s\-]", " ", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
+# ─── Normalización de códigos (llave de costeo) ───────────────────────
 
 def _norm_code(x) -> str:
     """Normaliza un código interno / SKU para matchear exacto: str, sin
@@ -72,49 +56,12 @@ def _norm_code(x) -> str:
         s = s.lstrip("0") or "0"
     return s
 
-_STOP = {"de","la","el","con","para","y","en","a","2","1","cm","cms","un","una",
-         "x","color","blanco","negro","gris","uni","mm","lt","lts","w"}
-
-def _key_tokens(norm_title: str) -> set:
-    """Tokens distintivos: códigos de modelo (letra+dígito), nros >=4
-    dígitos, y BTU (12k/9k/18k). Son los que identifican un producto."""
-    toks = set()
-    for t in norm_title.split():
-        if t in _STOP or len(t) < 2:
-            continue
-        has_d = any(c.isdigit() for c in t)
-        has_a = any(c.isalpha() for c in t)
-        if (has_d and has_a) or (t.isdigit() and len(t) >= 4) or re.fullmatch(r"\d{1,2}k", t):
-            toks.add(t)
-    return toks
-
-def _strong_tokens(norm_title: str) -> set:
-    """Identificadores FUERTES: códigos de modelo / nros de parte. Excluye el
-    BTU (12k/9k), que es débil (muchos aires distintos comparten '12k' y
-    generaban falsos positivos). Un match exige compartir al menos uno de
-    estos (o dos key-tokens corroborados)."""
-    toks = set()
-    for t in norm_title.split():
-        if t in _STOP or len(t) < 3:
-            continue
-        if re.fullmatch(r"\d{1,2}k", t):          # BTU => débil, no fuerte
-            continue
-        has_d = any(c.isdigit() for c in t)
-        has_a = any(c.isalpha() for c in t)
-        if (has_d and has_a and len(t) >= 4) or (t.isdigit() and len(t) >= 4):
-            toks.add(t)
-    return toks
-
-def _all_tokens(norm_title: str) -> set:
-    return {t for t in norm_title.split() if t not in _STOP and len(t) >= 3}
-
 
 class RentaCalculator:
     def __init__(self, sales_extractor, storage):
         self.sales   = sales_extractor
         self.storage = storage
         self._cost_df = None
-        self._cost_idx = None     # token -> set(row_pos)  (match por título, fallback)
         self._cost_by_code = None # código interno -> {costo_usd, descripcion} (llave exacta)
 
     # ─── Listado de costos ────────────────────────────────────────────
@@ -127,15 +74,6 @@ class RentaCalculator:
             self._cost_df = pd.DataFrame(columns=["codigo","descripcion","grupo","costo_usd"])
             return self._cost_df
         df = df[df["costo_usd"] > 0].copy().reset_index(drop=True)
-        df["_norm"]   = df["descripcion"].map(_norm)
-        df["_keys"]   = df["_norm"].map(_key_tokens)
-        df["_strong"] = df["_norm"].map(_strong_tokens)
-        df["_toks"]   = df["_norm"].map(_all_tokens)
-        # índice invertido por token FUERTE (match por título, sólo fallback).
-        idx = {}
-        for pos, strong in enumerate(df["_strong"]):
-            for k in strong:
-                idx.setdefault(k, set()).add(pos)
         # LLAVE EXACTA: código interno -> costo. En ML cada venta trae ese
         # código en seller_sku, así que el costeo es costo real × venta real.
         by_code = {}
@@ -144,7 +82,7 @@ class RentaCalculator:
             if k:
                 by_code[k] = {"costo_usd": float(r["costo_usd"]),
                               "descripcion": str(r["descripcion"])}
-        self._cost_df, self._cost_idx, self._cost_by_code = df, idx, by_code
+        self._cost_df, self._cost_by_code = df, by_code
         return df
 
     def cost_for_sku(self, seller_sku, seller_custom_field=None):
@@ -157,40 +95,6 @@ class RentaCalculator:
             k = _norm_code(raw)
             if k and k in by:
                 return by[k]["costo_usd"], k
-        return None, None
-
-    def match_cost(self, item_title: str):
-        """Devuelve (costo_usd, codigo) del mejor match, o (None, None).
-        Exige compartir al menos un token FUERTE (código/modelo); el BTU y los
-        tokens genéricos sólo desempatan. Evita los falsos positivos que
-        inflaban el COGS."""
-        df = self.load_cost_list()
-        if df.empty:
-            return None, None
-        n = _norm(item_title)
-        strong = _strong_tokens(n)
-        keys   = _key_tokens(n)
-        toks   = _all_tokens(n)
-        if not strong:
-            return None, None
-        # candidatos: filas que comparten al menos un token fuerte
-        cands = set()
-        for k in strong:
-            cands |= self._cost_idx.get(k, set())
-        if not cands:
-            return None, None
-        best, best_score, best_strong = None, 0.0, 0
-        for pos in cands:
-            row = df.iloc[pos]
-            s_strong = len(strong & row["_strong"])
-            s_keys   = len(keys   & row["_keys"])
-            s_toks   = len(toks   & row["_toks"])
-            score = s_strong * 10 + s_keys * 2 + s_toks
-            if score > best_score:
-                best, best_score, best_strong = row, score, s_strong
-        # exigir al menos UN token fuerte compartido
-        if best is not None and best_strong >= 1:
-            return float(best["costo_usd"]), str(best["codigo"])
         return None, None
 
     # ─── Envíos en paralelo ───────────────────────────────────────────
@@ -288,6 +192,10 @@ class RentaCalculator:
         coverage   = rev_matched / rev_total if rev_total > 0 else 0.0
         # Ratio COGS REAL sobre lo cubierto (costo real / venta real).
         cogs_ratio_real = cogs_matched / rev_matched if rev_matched > 0 else 0.0
+        # Guardia anti-número-falso: si el listado no está o casi nada matchea,
+        # el COGS da ~0 y la renta se infla. Se marca como NO confiable para
+        # que el panel avise en vez de mostrar una ganancia irreal.
+        n_cost_codes = len(self._cost_by_code or {})
 
         # Diagnóstico: top SKU por facturación con su margen real.
         _diag = []
@@ -347,6 +255,8 @@ class RentaCalculator:
             "rev_total":        round(rev_total, 2),
             "n_items_match":    int(df["matched"].sum()),
             "n_items_total":    int(len(df)),
+            "cost_list_n":      n_cost_codes,
+            "reliable":         bool(n_cost_codes > 0 and coverage >= 0.5),
             "diagnostico":      _diag,
             "computed_at":      datetime.now().isoformat(),
         }
