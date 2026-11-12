@@ -703,20 +703,37 @@ if page == "🏠 Resumen":
             with _acol:
                 st.caption(f"Actualizado hace {_age:.0f} h · costeo real por SKU "
                            f"(cobertura {_cov0:.0f}%) · envíos reales de la API")
+            _vista = st.radio("Vista", ["📅 Proyectada a fin de mes", "📍 Realizada a hoy"],
+                              horizontal=True, label_visibility="collapsed", key="renta_vista")
+            _hoy = _vista.startswith("📍")
+            if _hoy:
+                _f  = _renta.get("facturacion_hoy", 0); _nt = _renta.get("neto_hoy", 0)
+                _rt = _renta.get("renta_hoy", 0);       _mg = _renta.get("margen_hoy", 0)
+                _en = _renta.get("envios_hoy", 0);      _m1 = _renta.get("me1_gain_hoy", 0)
+                _cg = _renta.get("cogs_hoy", 0);        _ad = _renta.get("ads_hoy", 0)
+                _lbl = "facturado"
+            else:
+                _f  = _renta["facturacion"]; _nt = _renta["neto_mp"]
+                _rt = _renta["renta"];       _mg = _renta["margen_pct"]
+                _en = _renta["envios"];      _m1 = _renta.get("me1_gain", 0)
+                _cg = _renta["cogs"];        _ad = _renta["ads"]
+                _lbl = "proyectado"
             rm1, rm2, rm3, rm4, rm5 = st.columns(5)
-            rm1.metric("Facturación proyectada", fmt_currency(_renta["facturacion"]))
-            rm2.metric("Neto MP (×0,81)", fmt_currency(_renta["neto_mp"]))
-            rm3.metric("Renta neta", fmt_currency(_renta["renta"]),
-                       delta=f"{_renta['margen_pct']:.1f}% margen")
-            rm4.metric("Envíos ME2 (tu costo)", fmt_currency(_renta["envios"]))
-            rm5.metric("Ganancia envío ME1", fmt_currency(_renta.get("me1_gain", 0)),
+            rm1.metric(f"Facturación ({_lbl})", fmt_currency(_f))
+            rm2.metric("Neto MP (×0,81)", fmt_currency(_nt))
+            rm3.metric("Renta neta", fmt_currency(_rt), delta=f"{_mg:.1f}% margen")
+            rm4.metric("Envíos ME2 (tu costo)", fmt_currency(_en))
+            rm5.metric("Ganancia envío ME1", fmt_currency(_m1),
                        help="Lo que ganás en envíos ME1 (el comprador paga el envío y vos despachás "
                             "más barato). Se suma a la renta.")
+            if _hoy:
+                st.caption(f"📍 Realizada a hoy: sobre lo **facturado a la fecha** "
+                           f"({fmt_md(_f)}, {_renta['match_coverage_pct']:.0f}% del costeo cubierto). "
+                           "Envíos y ME1 son los reales medidos; ADS prorrateado por la parte del mes.")
             _comp = pd.DataFrame({
                 "Concepto": ["Costo mercadería", "Comisión+imp.", "Publicidad", "Envíos ME2",
                              "Gan. ME1", "Renta neta"],
-                "Monto":    [_renta["cogs"], _renta["comision_imp"], _renta["ads"],
-                             _renta["envios"], _renta.get("me1_gain", 0), _renta["renta"]],
+                "Monto":    [_cg, (_f * (1 - 0.81)), _ad, _en, _m1, _rt],
             })
             _figr = px.bar(_comp, x="Concepto", y="Monto", color="Concepto",
                            color_discrete_sequence=["#3483FA", "#FFC043", "#9B8CFF", "#FF6B6B",

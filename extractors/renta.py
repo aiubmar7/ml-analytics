@@ -381,7 +381,7 @@ class RentaCalculator:
         renta = neto_mp - cogs_proy - ads - envios_proy + me1_gain_proy
         margen = renta / fact_proy if fact_proy > 0 else 0.0
 
-        return {
+        out = {
             "mes":              forecast.get("month"),
             "tc":               tc,
             "me1_cost_pct":     round(float(me1_cost_pct or 0.0), 1),
@@ -411,8 +411,32 @@ class RentaCalculator:
             "diag_falta":       _diag_falta,
             "computed_at":      datetime.now().isoformat(),
         }
+        out.update(self._todate_view(rev_sofar, envios_sofar, me1_ingreso_sofar,
+                                     cogs_ratio_real, ads, me1_keep, fact_proy))
+        return out
 
     # ─── Cache en Dropbox (el cálculo pega N veces a /shipments) ───────
+
+    @staticmethod
+    def _todate_view(rev_sofar, envios_sofar, me1_ing_sofar, cogs_ratio,
+                     ads, me1_keep, fact) -> dict:
+        """Renta REALIZADA a hoy (no proyectada): usa lo facturado a la fecha y
+        los envíos/ME1 YA medidos. ADS se prorratea por la fracción de mes
+        facturada."""
+        fact_hoy   = float(rev_sofar)
+        neto_hoy   = fact_hoy * NETO_MP_RATE
+        cogs_hoy   = cogs_ratio * fact_hoy
+        ads_hoy    = float(ads) * (fact_hoy / fact) if fact > 0 else 0.0
+        envios_hoy = float(envios_sofar)
+        me1_hoy    = float(me1_ing_sofar) * me1_keep
+        renta_hoy  = neto_hoy - cogs_hoy - ads_hoy - envios_hoy + me1_hoy
+        return {
+            "facturacion_hoy": round(fact_hoy, 2), "neto_hoy": round(neto_hoy, 2),
+            "cogs_hoy": round(cogs_hoy, 2), "ads_hoy": round(ads_hoy, 2),
+            "envios_hoy": round(envios_hoy, 2), "me1_gain_hoy": round(me1_hoy, 2),
+            "renta_hoy": round(renta_hoy, 2),
+            "margen_hoy": round((renta_hoy / fact_hoy * 100) if fact_hoy > 0 else 0, 1),
+        }
 
     @staticmethod
     def _apply_params(res: dict, ads: float, tc: float, fact_live: float = None,
@@ -453,6 +477,8 @@ class RentaCalculator:
         r["me1_gain"]            = round(me1_gain, 2)
         r["renta"]               = round(renta, 2)
         r["margen_pct"]          = round((renta / fact * 100) if fact > 0 else 0, 1)
+        r.update(RentaCalculator._todate_view(rev_sofar, envios_sofar, me1_ing_sofar,
+                                              cogs_ratio, ads, me1_keep, fact))
         return r
 
     @staticmethod
