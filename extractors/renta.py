@@ -271,6 +271,8 @@ class RentaCalculator:
         fact_proy = float(forecast["forecast_revenue"])
         rev_sofar = float(forecast["revenue_so_far"]) or 1.0
         d_elapsed = int(forecast["days_elapsed"])
+        _dim = int(forecast.get("days_in_month") or 30)
+        _days_frac = (d_elapsed / _dim) if _dim > 0 else 0.5   # fracción de mes transcurrida
 
         # Ventas del mes a la fecha, a nivel ítem. SIN envíos acá (los traigo
         # en paralelo más abajo: recorrer ~750 envíos secuencial tardaba ~5 min).
@@ -409,24 +411,25 @@ class RentaCalculator:
             "reliable":         bool(n_cost_codes > 0 and coverage >= 0.5),
             "diagnostico":      _diag,
             "diag_falta":       _diag_falta,
+            "days_frac":        round(_days_frac, 4),
             "computed_at":      datetime.now().isoformat(),
         }
         out.update(self._todate_view(rev_sofar, envios_sofar, me1_ingreso_sofar,
-                                     cogs_ratio_real, ads, me1_keep, fact_proy))
+                                     cogs_ratio_real, ads, me1_keep, _days_frac))
         return out
 
     # ─── Cache en Dropbox (el cálculo pega N veces a /shipments) ───────
 
     @staticmethod
     def _todate_view(rev_sofar, envios_sofar, me1_ing_sofar, cogs_ratio,
-                     ads, me1_keep, fact) -> dict:
+                     ads, me1_keep, days_frac) -> dict:
         """Renta REALIZADA a hoy (no proyectada): usa lo facturado a la fecha y
         los envíos/ME1 YA medidos. ADS se prorratea por la fracción de mes
         facturada."""
         fact_hoy   = float(rev_sofar)
         neto_hoy   = fact_hoy * NETO_MP_RATE
         cogs_hoy   = cogs_ratio * fact_hoy
-        ads_hoy    = float(ads) * (fact_hoy / fact) if fact > 0 else 0.0
+        ads_hoy    = float(ads) * max(0.0, min(1.0, float(days_frac)))   # prorrateo por días
         envios_hoy = float(envios_sofar)
         me1_hoy    = float(me1_ing_sofar) * me1_keep
         renta_hoy  = neto_hoy - cogs_hoy - ads_hoy - envios_hoy + me1_hoy
@@ -478,7 +481,8 @@ class RentaCalculator:
         r["renta"]               = round(renta, 2)
         r["margen_pct"]          = round((renta / fact * 100) if fact > 0 else 0, 1)
         r.update(RentaCalculator._todate_view(rev_sofar, envios_sofar, me1_ing_sofar,
-                                              cogs_ratio, ads, me1_keep, fact))
+                                              cogs_ratio, ads, me1_keep,
+                                              float(r.get("days_frac", 0.5))))
         return r
 
     @staticmethod
