@@ -631,35 +631,29 @@ if page == "🏠 Resumen":
                    "(real por SKU) − publicidad − envíos ME2. Sólo canal ML, mes proyectado a fin de mes.")
         rc = clients["renta"]
         _rp = rc.load_params()
-        rpc1, rpc2, rpc3 = st.columns(3)
+        rpc1, rpc2 = st.columns(2)
         with rpc1:
-            _mk = st.number_input("Markup de relleno (%)", min_value=1.0,
-                                  value=float(_rp.get("markup", 52.0)), step=1.0, format="%.0f",
-                                  help="El costo se toma REAL del listado por SKU (seller_sku). Este "
-                                       "markup sólo se usa para la facturación que todavía no tiene "
-                                       "SKU matcheado. Con cobertura 100% no se usa.")
-        with rpc2:
             _ads = st.number_input("Publicidad del mes — ADS (UYU)", min_value=0.0,
                                    value=float(_rp["ads"]), step=50000.0, format="%.0f",
-                                   help="Inversión en Product Ads del mes. Cargala vos; la app no la ve.")
-        with rpc3:
+                                   help="Inversión en Product Ads del mes. Único dato que la app no ve "
+                                        "aún; el resto (costo por SKU y envíos) sale solo.")
+        with rpc2:
             _tc = st.number_input("TC del mes (USD→UYU)", min_value=1.0,
                                   value=float(_rp["tc"]), step=0.05, format="%.2f",
-                                  help="Tipo de cambio (sólo afecta el costeo por producto del diagnóstico).")
-        if abs(_tc - _rp["tc"]) > 1e-6 or abs(_ads - _rp["ads"]) > 0.5 or abs(_mk - _rp.get("markup", 52.0)) > 1e-6:
-            rc.save_params(_tc, _ads, _mk)
+                                  help="Tipo de cambio con que se valúa el costo en USD del listado.")
+        if abs(_tc - _rp["tc"]) > 1e-6 or abs(_ads - _rp["ads"]) > 0.5:
+            rc.save_params(_tc, _ads)
 
         _bcol, _acol = st.columns([1, 2])
         with _bcol:
             _recalc = st.button("🔄 Calcular / actualizar renta", type="secondary",
-                                help="Recorre los envíos del mes en la API (~1 consulta por orden, "
-                                     "en paralelo). Tarda ~40 s; queda cacheado. Cambiar markup/ADS "
-                                     "no re-corre esto, se recalcula al instante.")
+                                help="Recorre los envíos del mes en la API (en paralelo, ~40 s) y "
+                                     "costea cada SKU. Queda cacheado; cambiar TC/ADS se recalcula al instante.")
         if _recalc:
-            with st.spinner("Costeando ventas y recorriendo envíos del mes… (~40 s)"):
-                _renta, _age = rc.get_renta_cached(tc=_tc, ads=_ads, markup=_mk, forecast=forecast, force=True)
+            with st.spinner("Costeando por SKU y recorriendo envíos del mes… (~40 s)"):
+                _renta, _age = rc.get_renta_cached(tc=_tc, ads=_ads, forecast=forecast, force=True)
         else:
-            _renta, _age = rc.peek_cache(tc=_tc, ads=_ads, markup=_mk)
+            _renta, _age = rc.peek_cache(tc=_tc, ads=_ads)
 
         if _renta is None:
             st.caption("Todavía no calculaste la renta. Tocá **Calcular / actualizar renta** (una vez).")
@@ -687,16 +681,15 @@ if page == "🏠 Resumen":
             st.plotly_chart(_figr, use_container_width=True)
             _cov = _renta['match_coverage_pct']
             st.caption(
-                f"COGS = costo real del listado × precio real de venta, por SKU "
-                f"(cobertura {_cov:.0f}% de la facturación; el resto se completa con el markup de "
-                f"relleno). COGS global {_renta['cogs_ratio_pct']:.0f}% de la venta · margen real "
-                f"sobre lo cubierto {_renta.get('cogs_ratio_real_pct', 0):.0f}%. "
+                f"COGS = costo real del listado (FacturApp) × precio real de venta, SKU por SKU. "
+                f"COGS {_renta['cogs_ratio_pct']:.0f}% de la venta · cobertura {_cov:.0f}% "
+                f"(lo no cubierto se proyecta con el mismo ratio real, sin markup). "
                 f"Envíos del mes a hoy: {fmt_md(_renta['envios_sofar'])} (reales, API). Proyectado a fin de mes."
             )
             if _cov < 85:
-                st.info(f"ℹ️ Cobertura de SKU {_cov:.0f}%: el {100-_cov:.0f}% de la facturación sin "
-                        "SKU matcheado se costea con el markup de relleno. Suele ser por SKU nuevos o "
-                        "sin código cargado en ML.")
+                st.info(f"ℹ️ Cobertura de SKU {_cov:.0f}%: el {100-_cov:.0f}% de la facturación no tiene "
+                        "SKU matcheado (SKU nuevos o sin código en ML/listado) y se proyecta con el "
+                        "mismo margen real medido. Abrí el diagnóstico y pasame esos SKU para afinar.")
             _diag = _renta.get("diagnostico") or []
             if _diag:
                 with st.expander(f"🔎 Costeo real por SKU (top 20) — margen por producto"):

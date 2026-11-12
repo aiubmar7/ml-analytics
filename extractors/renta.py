@@ -220,13 +220,11 @@ class RentaCalculator:
             p = self.storage.load_json(RENTA_PARAMS_PATH) or {}
         except Exception:
             p = {}
-        return {"tc": float(p.get("tc", DEFAULT_TC)), "ads": float(p.get("ads", 0.0)),
-                "markup": float(p.get("markup", 52.0))}
+        return {"tc": float(p.get("tc", DEFAULT_TC)), "ads": float(p.get("ads", 0.0))}
 
-    def save_params(self, tc: float, ads: float, markup: float = 52.0) -> None:
+    def save_params(self, tc: float, ads: float) -> None:
         try:
             self.storage.save_json({"tc": float(tc), "ads": float(ads),
-                                    "markup": float(markup),
                                     "updated_at": datetime.now().isoformat()},
                                    RENTA_PARAMS_PATH)
         except Exception as e:
@@ -235,13 +233,13 @@ class RentaCalculator:
     # ─── Cálculo principal ────────────────────────────────────────────
 
     def get_renta(self, as_of=None, tc: float = DEFAULT_TC, ads: float = 0.0,
-                  markup_pct: float = 52.0, forecast: dict = None) -> dict:
-        """Renta del mes en curso (canal ML).
+                  forecast: dict = None) -> dict:
+        """Renta del mes en curso (canal ML), AUTOMÁTICA.
 
-        COGS de cabecera = markup promedio (markup_pct, default +52% — validado
-        contra el listado de costos). Es estable. El costeo por match de
-        producto se calcula igual pero sólo como DIAGNÓSTICO/referencia, porque
-        ML y el listado nombran distinto los productos y el match es ruidoso."""
+        COGS = costo real del SKU (listado FacturApp, por seller_sku) × el
+        precio real al que se vendió ese SKU en ML. Sin markup ni perillas: el
+        margen sale solo, SKU por SKU. Lo no cubierto se proyecta con el mismo
+        ratio real medido (no con un markup inventado)."""
         if forecast is None or "error" in (forecast or {}):
             forecast = self.sales.get_monthly_forecast(as_of=as_of)
         if "error" in forecast:
@@ -271,23 +269,24 @@ class RentaCalculator:
         self.load_cost_list()
         _sku_col = df["seller_sku"] if "seller_sku" in df.columns else [None] * len(df)
         _cf_col  = df["seller_custom_field"] if "seller_custom_field" in df.columns else [None] * len(df)
-        costos, matched, codes = [], [], []
+        costos_usd, matched, codes = [], [], []
         for sku, cf, q in zip(_sku_col, _cf_col, df["quantity"]):
             c, cod = self.cost_for_sku(sku, cf)
             if c is None:
-                costos.append(0.0); matched.append(False); codes.append(None)
+                costos_usd.append(0.0); matched.append(False); codes.append(None)
             else:
-                costos.append(c * float(q) * tc); matched.append(True); codes.append(cod)
-        df["cogs_item"] = costos
+                costos_usd.append(c * float(q)); matched.append(True); codes.append(cod)
+        df["cogs_usd"]  = costos_usd                      # costo en USD (pre-TC)
+        df["cogs_item"] = df["cogs_usd"] * tc             # COGS en UYU
         df["matched"]   = matched
         df["cod"]       = codes
 
-        rev_total    = float(df["rev_item"].sum())
-        rev_matched  = float(df.loc[df["matched"], "rev_item"].sum())
-        rev_unmatch  = rev_total - rev_matched
-        cogs_matched = float(df.loc[df["matched"], "cogs_item"].sum())
+        rev_total        = float(df["rev_item"].sum())
+        rev_matched      = float(df.loc[df["matched"], "rev_item"].sum())
+        cogs_usd_matched = float(df.loc[df["matched"], "cogs_usd"].sum())
+        cogs_matched     = cogs_usd_matched * tc
         coverage   = rev_matched / rev_total if rev_total > 0 else 0.0
-        # Ratio COGS real sobre lo matcheado (costo real / venta real).
+        # Ratio COGS REAL sobre lo cubierto (costo real / venta real).
         cogs_ratio_real = cogs_matched / rev_matched if rev_matched > 0 else 0.0
 
         # Diagnóstico: top SKU por facturación con su margen real.
@@ -317,13 +316,10 @@ class RentaCalculator:
         # Proyección a fin de mes (escala por facturación).
         scale = fact_proy / rev_sofar if rev_sofar > 0 else 1.0
         neto_mp   = fact_proy * NETO_MP_RATE
-        # COGS de CABECERA: costo REAL por SKU donde hay cobertura; el markup
-        # (ajustable) sólo rellena la facturación que todavía no tiene SKU
-        # matcheado. Con cobertura 100% es 100% costo real.
-        markup_pct   = float(markup_pct or 52.0)
-        markup_ratio = 1.0 / (1.0 + markup_pct / 100.0)
-        blended_ratio = coverage * cogs_ratio_real + (1 - coverage) * markup_ratio
-        cogs_proy = blended_ratio * fact_proy
+        # COGS AUTOMÁTICO: ratio real medido por SKU, extrapolado a la
+        # facturación proyectada. Sin markup. Con cobertura <100% se asume que
+        # lo no cubierto tiene el mismo ratio real (la cobertura se muestra).
+        cogs_proy = cogs_ratio_real * fact_proy
         envios_proy = envios_sofar * scale
         ads = float(ads or 0.0)
 
@@ -333,7 +329,6 @@ class RentaCalculator:
         return {
             "mes":              forecast.get("month"),
             "tc":               tc,
-            "markup_pct":       round(markup_pct, 1),
             "facturacion":      round(fact_proy, 2),
             "neto_mp":          round(neto_mp, 2),
             "comision_imp":     round(fact_proy * (1 - NETO_MP_RATE), 2),
@@ -342,15 +337,16 @@ class RentaCalculator:
             "envios":           round(envios_proy, 2),
             "renta":            round(renta, 2),
             "margen_pct":       round(margen * 100, 1),
-            "cogs_ratio_pct":   round(blended_ratio * 100, 1),
-            "cogs_ratio_real_pct": round(cogs_ratio_real * 100, 1),   # costo real s/ cubierto
+            "cogs_ratio_pct":   round(cogs_ratio_real * 100, 1),
+            "cogs_ratio_real_pct": round(cogs_ratio_real * 100, 1),
             "match_coverage_pct": round(coverage * 100, 1),
             "envios_sofar":     round(envios_sofar, 2),
             "rev_sofar":        round(rev_sofar, 2),
-            "n_items_match":    int(df["matched"].sum()),
-            "n_items_total":    int(len(df)),
+            "cogs_usd_matched": round(cogs_usd_matched, 2),   # base para recalcular con otro TC
             "rev_matched":      round(rev_matched, 2),
             "rev_total":        round(rev_total, 2),
+            "n_items_match":    int(df["matched"].sum()),
+            "n_items_total":    int(len(df)),
             "diagnostico":      _diag,
             "computed_at":      datetime.now().isoformat(),
         }
@@ -358,57 +354,57 @@ class RentaCalculator:
     # ─── Cache en Dropbox (el cálculo pega N veces a /shipments) ───────
 
     @staticmethod
-    def _apply_params(res: dict, ads: float, markup: float) -> dict:
-        """Re-deriva la parte BARATA (COGS por markup, ADS, renta) sobre una
-        base ya calculada (facturación, neto, envíos). Evita re-barrer envíos
-        cuando sólo cambian markup o ADS."""
+    def _apply_params(res: dict, ads: float, tc: float) -> dict:
+        """Re-deriva la parte BARATA (COGS al TC actual, ADS, renta) sobre una
+        base ya calculada (facturación, neto, envíos, costo USD matcheado).
+        Evita re-barrer envíos cuando sólo cambian TC o ADS."""
         r = dict(res)
-        fact   = float(r.get("facturacion", 0.0))
-        neto   = float(r.get("neto_mp", 0.0))
-        envios = float(r.get("envios", 0.0))          # ya proyectado
-        markup = float(markup or 52.0); ads = float(ads or 0.0)
-        # COGS mezclado: real por SKU donde hay cobertura, markup para el resto.
-        cov        = float(r.get("match_coverage_pct", 0.0)) / 100.0
-        real_ratio = float(r.get("cogs_ratio_real_pct", 0.0)) / 100.0
-        markup_ratio  = 1.0 / (1.0 + markup / 100.0)
-        blended_ratio = cov * real_ratio + (1 - cov) * markup_ratio
-        cogs  = blended_ratio * fact
+        fact        = float(r.get("facturacion", 0.0))
+        neto        = float(r.get("neto_mp", 0.0))
+        envios      = float(r.get("envios", 0.0))               # ya proyectado
+        rev_matched = float(r.get("rev_matched", 0.0))
+        cogs_usd_m  = float(r.get("cogs_usd_matched", 0.0))
+        ads = float(ads or 0.0); tc = float(tc or DEFAULT_TC)
+        # Ratio COGS real al TC actual (costo USD × TC / venta real cubierta).
+        cogs_ratio = (cogs_usd_m * tc / rev_matched) if rev_matched > 0 else 0.0
+        cogs  = cogs_ratio * fact
         renta = neto - cogs - ads - envios
-        r["markup_pct"]     = round(markup, 1)
-        r["ads"]            = round(ads, 2)
-        r["cogs"]           = round(cogs, 2)
-        r["cogs_ratio_pct"] = round(blended_ratio * 100, 1)
-        r["renta"]          = round(renta, 2)
-        r["margen_pct"]     = round((renta / fact * 100) if fact > 0 else 0, 1)
+        r["tc"]                 = round(tc, 2)
+        r["ads"]                = round(ads, 2)
+        r["cogs"]               = round(cogs, 2)
+        r["cogs_ratio_pct"]     = round(cogs_ratio * 100, 1)
+        r["cogs_ratio_real_pct"] = round(cogs_ratio * 100, 1)
+        r["renta"]              = round(renta, 2)
+        r["margen_pct"]         = round((renta / fact * 100) if fact > 0 else 0, 1)
         return r
 
-    def peek_cache(self, tc: float = DEFAULT_TC, ads: float = 0.0, markup: float = 52.0):
+    def peek_cache(self, tc: float = DEFAULT_TC, ads: float = 0.0):
         """Lee el cache SIN calcular (carga normal del dashboard) y re-deriva
         COGS/ADS para los parámetros actuales. (None, None) si no hay cache."""
         try:
             c = self.storage.load_json(RENTA_CACHE_PATH)
-            if c and c.get("ts") and c.get("result"):
+            if c and c.get("ts") and c.get("result") and "cogs_usd_matched" in c["result"]:
                 age = (datetime.now().timestamp() - c["ts"]) / 3600.0
-                return self._apply_params(c["result"], ads, markup), age
+                return self._apply_params(c["result"], ads, tc), age
         except Exception:
             pass
         return None, None
 
     def get_renta_cached(self, max_age_h: float = 12, force: bool = False,
                          tc: float = DEFAULT_TC, ads: float = 0.0,
-                         markup: float = 52.0, forecast: dict = None):
+                         forecast: dict = None):
         """Devuelve (renta, edad_horas). El barrido de envíos (caro) sólo corre
-        si force=True o si el cache venció; markup/ADS se recalculan al vuelo."""
+        si force=True o si el cache venció; TC/ADS se recalculan al vuelo."""
         if not force:
             try:
                 c = self.storage.load_json(RENTA_CACHE_PATH)
-                if c and c.get("ts") and c.get("result"):
+                if c and c.get("ts") and c.get("result") and "cogs_usd_matched" in c["result"]:
                     age = (datetime.now().timestamp() - c["ts"]) / 3600.0
                     if age < max_age_h:
-                        return self._apply_params(c["result"], ads, markup), age
+                        return self._apply_params(c["result"], ads, tc), age
             except Exception:
                 pass
-        res = self.get_renta(tc=tc, ads=ads, markup=markup, forecast=forecast)
+        res = self.get_renta(tc=tc, ads=ads, forecast=forecast)
         if "error" not in res:
             try:
                 self.storage.save_json(
