@@ -181,9 +181,9 @@ class RentaCalculator:
         except Exception:
             p = {}
         return {"tc": float(p.get("tc", DEFAULT_TC)), "ads": float(p.get("ads", 0.0)),
-                "me1_cost": float(p.get("me1_cost", 45.0))}
+                "me1_cost": float(p.get("me1_cost", 50.0))}
 
-    def save_params(self, tc: float, ads: float, me1_cost: float = 45.0) -> None:
+    def save_params(self, tc: float, ads: float, me1_cost: float = 50.0) -> None:
         try:
             self.storage.save_json({"tc": float(tc), "ads": float(ads),
                                     "me1_cost": float(me1_cost),
@@ -195,7 +195,7 @@ class RentaCalculator:
     # ─── Cálculo principal ────────────────────────────────────────────
 
     def get_renta(self, as_of=None, tc: float = DEFAULT_TC, ads: float = 0.0,
-                  me1_cost_pct: float = 45.0, forecast: dict = None) -> dict:
+                  me1_cost_pct: float = 50.0, forecast: dict = None) -> dict:
         """Renta del mes en curso (canal ML), AUTOMÁTICA.
 
         COGS = costo real del SKU (listado FacturApp, por seller_sku) × el
@@ -353,7 +353,7 @@ class RentaCalculator:
         cogs_usd_m  = float(r.get("cogs_usd_matched", 0.0))
         ads = float(ads or 0.0); tc = float(tc or DEFAULT_TC)
         if me1_cost_pct is None:
-            me1_cost_pct = float(r.get("me1_cost_pct", 45.0))
+            me1_cost_pct = float(r.get("me1_cost_pct", 50.0))
         me1_keep = 1.0 - float(me1_cost_pct) / 100.0
         scale = fact / rev_sofar if rev_sofar > 0 else 1.0
         neto = fact * NETO_MP_RATE
@@ -385,7 +385,7 @@ class RentaCalculator:
         return None
 
     def peek_cache(self, tc: float = DEFAULT_TC, ads: float = 0.0,
-                   me1_cost_pct: float = 45.0, forecast: dict = None):
+                   me1_cost_pct: float = 50.0, forecast: dict = None):
         """Lee el cache SIN calcular (carga normal del dashboard) y re-deriva
         con la facturación viva del pronóstico. (None, None) si no hay cache."""
         try:
@@ -399,7 +399,7 @@ class RentaCalculator:
 
     def get_renta_cached(self, max_age_h: float = 12, force: bool = False,
                          tc: float = DEFAULT_TC, ads: float = 0.0,
-                         me1_cost_pct: float = 45.0, forecast: dict = None):
+                         me1_cost_pct: float = 50.0, forecast: dict = None):
         """Devuelve (renta, edad_horas). El barrido de envíos (caro) sólo corre
         si force=True o si el cache venció; TC/ADS/costo-ME1 y la facturación
         viva se recalculan al vuelo."""

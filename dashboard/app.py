@@ -643,11 +643,11 @@ if page == "🏠 Resumen":
                                   help="Tipo de cambio con que se valúa el costo en USD del listado.")
         with rpc3:
             _me1 = st.number_input("Costo despacho ME1 (%)", min_value=0.0, max_value=100.0,
-                                   value=float(_rp.get("me1_cost", 45.0)), step=5.0, format="%.0f",
+                                   value=float(_rp.get("me1_cost", 50.0)), step=5.0, format="%.0f",
                                    help="Lo que te cuesta despachar un ME1 como % de lo que paga el "
                                         "comprador (DAC/correo). El resto es tu ganancia de envío ME1, "
                                         "que se suma a la renta.")
-        if abs(_tc - _rp["tc"]) > 1e-6 or abs(_ads - _rp["ads"]) > 0.5 or abs(_me1 - _rp.get("me1_cost", 45.0)) > 1e-6:
+        if abs(_tc - _rp["tc"]) > 1e-6 or abs(_ads - _rp["ads"]) > 0.5 or abs(_me1 - _rp.get("me1_cost", 50.0)) > 1e-6:
             rc.save_params(_tc, _ads, _me1)
 
         # Cargador del listado de costos: lo guarda en Dropbox con la conexión
