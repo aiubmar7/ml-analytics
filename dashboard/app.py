@@ -660,14 +660,7 @@ if page == "🏠 Resumen":
                                    key="costos_uploader")
             if _up is not None and st.button("💾 Guardar listado en Dropbox", type="secondary"):
                 try:
-                    _name = _up.name.lower()
-                    if _name.endswith(".parquet"):
-                        _raw = pd.read_parquet(_up)
-                    elif _name.endswith((".xlsx", ".xls")):
-                        _raw = pd.read_excel(_up)
-                    else:
-                        _raw = pd.read_csv(_up, sep=None, engine="python")
-                    _n, _msg = rc.save_cost_list(_raw)
+                    _n, _msg = rc.save_uploaded_cost(_up)
                     if _n > 0:
                         try:
                             clients["storage"].save_json(

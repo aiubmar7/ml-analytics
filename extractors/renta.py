@@ -142,6 +142,67 @@ class RentaCalculator:
         self._cost_df = None; self._cost_by_code = None   # invalidar cache en memoria
         return len(out), f"Guardados {len(out)} costos en Dropbox (columnas: {cod_col} → {cost_col})."
 
+    def save_uploaded_cost(self, uploaded_file) -> tuple:
+        """Lee un archivo de costos subido y lo guarda en Dropbox. Maneja:
+        - parquet / excel (vía save_cost_list genérico),
+        - CSV UTF-8 limpio (columnas codigo/costo), y
+        - el export 'Listado de Stock' de FacturApp: latin-1, 2 filas de título,
+          columnas dispersas y costo como 'U$S' + número en celdas separadas."""
+        import io, csv as _csv
+        name = (getattr(uploaded_file, "name", "") or "").lower()
+        data = uploaded_file.read()
+        if name.endswith(".parquet"):
+            return self.save_cost_list(pd.read_parquet(io.BytesIO(data)))
+        if name.endswith((".xlsx", ".xls")):
+            return self.save_cost_list(pd.read_excel(io.BytesIO(data)))
+        # CSV: decodificar probando encodings (FacturApp exporta en latin-1).
+        text = None
+        for enc in ("utf-8-sig", "utf-8", "latin-1", "cp1252"):
+            try:
+                text = data.decode(enc); break
+            except Exception:
+                continue
+        if text is None:
+            return 0, "No pude decodificar el archivo (encoding desconocido)."
+        rows = [r for r in _csv.reader(io.StringIO(text)) if any(str(c).strip() for c in r)]
+        if not rows:
+            return 0, "El archivo vino vacío."
+        # ¿Formato FacturApp? fila header con 'Código' + celdas 'U$S' en los datos.
+        _n = lambda s: str(s).strip().lower()
+        hdr_i = next((i for i, r in enumerate(rows[:15])
+                      if any(_n(c) in ("código", "codigo") for c in r)), None)
+        is_fapp = hdr_i is not None and any(
+            _n(c) == "u$s" for r in rows[hdr_i + 1:hdr_i + 8] for c in r)
+        if is_fapp:
+            hdr = [_n(c) for c in rows[hdr_i]]
+            cod_col  = next((j for j, c in enumerate(hdr) if c in ("código", "codigo")), None)
+            desc_col = next((j for j, c in enumerate(hdr) if "descrip" in c), None)
+            out = []
+            for r in rows[hdr_i + 1:]:
+                if cod_col is None or cod_col >= len(r):
+                    continue
+                cod = _norm_code(r[cod_col])
+                if not cod or not cod.isdigit():
+                    continue
+                cost = 0.0
+                for j, c in enumerate(r):                    # primer 'U$S' = Precio Compra
+                    if str(c).strip() == "U$S" and j + 1 < len(r):
+                        cost = _parse_money(r[j + 1]); break
+                if cost <= 0:
+                    continue
+                desc = r[desc_col] if (desc_col is not None and desc_col < len(r)) else ""
+                if re.search(r"costo env|retiro de local", str(desc), re.I):
+                    continue
+                out.append({"codigo": cod, "descripcion": str(desc).strip(), "costo_usd": cost})
+            if not out:
+                return 0, "Detecté formato FacturApp pero no extraje costos > 0."
+            df = pd.DataFrame(out).drop_duplicates("codigo", keep="last")
+            self.storage.save_dataframe(df[["codigo", "descripcion", "costo_usd"]], COST_LIST_PATH)
+            self._cost_df = None; self._cost_by_code = None
+            return len(df), f"Guardados {len(df)} costos (formato FacturApp)."
+        # Genérico: CSV con columnas claras.
+        return self.save_cost_list(pd.read_csv(io.StringIO(text), sep=None, engine="python"))
+
     def cost_for_sku(self, seller_sku, seller_custom_field=None):
         """Costo USD por LLAVE EXACTA de SKU (código interno). Prueba
         seller_sku y, si no, seller_custom_field. Devuelve (costo_usd, codigo)
