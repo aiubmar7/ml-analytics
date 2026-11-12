@@ -156,22 +156,21 @@ class RentaCalculator:
 
     # ─── Envíos en paralelo ───────────────────────────────────────────
 
-    def _fetch_shipping_costs(self, shipping_ids, workers: int = 8) -> dict:
-        """Trae el costo de envío del vendedor para muchos shipping_id EN
-        PARALELO (reutiliza _seller_shipping_cost de MySalesExtractor, que ya
-        aplica la regla ME2-gratis→list_cost). Baja ~750 envíos de ~5 min a
-        ~30 s. requests.Session es thread-safe para requests independientes."""
+    def _fetch_shipping_econ(self, shipping_ids, workers: int = 8) -> dict:
+        """Trae la economía de envío de muchos shipping_id EN PARALELO:
+        sid -> (me2_costo_vendedor, me1_ingreso). Reutiliza shipment_econ de
+        MySalesExtractor. Baja ~750 envíos de ~5 min a ~30 s."""
         if not shipping_ids:
             return {}
         def _one(sid):
             try:
-                return sid, self.sales._seller_shipping_cost(sid)
+                return sid, self.sales.shipment_econ(sid)
             except Exception:
-                return sid, 0.0
+                return sid, (0.0, 0.0)
         out = {}
         with ThreadPoolExecutor(max_workers=workers) as ex:
-            for sid, cost in ex.map(_one, shipping_ids):
-                out[sid] = cost
+            for sid, econ in ex.map(_one, shipping_ids):
+                out[sid] = econ
         return out
 
     # ─── Parámetros (TC, ADS) persistidos en Dropbox ──────────────────
@@ -181,11 +180,13 @@ class RentaCalculator:
             p = self.storage.load_json(RENTA_PARAMS_PATH) or {}
         except Exception:
             p = {}
-        return {"tc": float(p.get("tc", DEFAULT_TC)), "ads": float(p.get("ads", 0.0))}
+        return {"tc": float(p.get("tc", DEFAULT_TC)), "ads": float(p.get("ads", 0.0)),
+                "me1_cost": float(p.get("me1_cost", 45.0))}
 
-    def save_params(self, tc: float, ads: float) -> None:
+    def save_params(self, tc: float, ads: float, me1_cost: float = 45.0) -> None:
         try:
             self.storage.save_json({"tc": float(tc), "ads": float(ads),
+                                    "me1_cost": float(me1_cost),
                                     "updated_at": datetime.now().isoformat()},
                                    RENTA_PARAMS_PATH)
         except Exception as e:
@@ -194,7 +195,7 @@ class RentaCalculator:
     # ─── Cálculo principal ────────────────────────────────────────────
 
     def get_renta(self, as_of=None, tc: float = DEFAULT_TC, ads: float = 0.0,
-                  forecast: dict = None) -> dict:
+                  me1_cost_pct: float = 45.0, forecast: dict = None) -> dict:
         """Renta del mes en curso (canal ML), AUTOMÁTICA.
 
         COGS = costo real del SKU (listado FacturApp, por seller_sku) × el
@@ -254,68 +255,73 @@ class RentaCalculator:
         # que el panel avise en vez de mostrar una ganancia irreal.
         n_cost_codes = len(self._cost_by_code or {})
 
-        # Envíos a la fecha: 1 consulta /shipments por ORDEN, en PARALELO. Los
-        # shipping_id salen del DataFrame como float (pandas), hay que pasarlos
-        # a int o la URL /shipments/123.0 da 404 (bug que ponía envíos en 0).
+        # Economía de envío a la fecha: 1 consulta /shipments por ORDEN, en
+        # PARALELO. Devuelve (me2_costo_vendedor, me1_ingreso). shipping_id sale
+        # como float del DataFrame -> int o /shipments/123.0 da 404.
         _sids = [int(s) for s in df["shipping_id"].dropna().unique().tolist()]
-        _ship_map = self._fetch_shipping_costs(_sids)
-        # ATRIBUCIÓN POR SKU: el envío ME2 que paga el vendedor (0 si lo paga el
-        # comprador / ME1) se reparte entre los ítems de la orden por su valor,
-        # para ver el margen REAL de cada SKU con su envío encima.
-        def _ship_of_order(sid):
-            return _ship_map.get(int(sid), 0.0) if pd.notna(sid) else 0.0
-        df["_ship_order"] = df["shipping_id"].map(_ship_of_order)
+        _econ = self._fetch_shipping_econ(_sids)
+        def _me2_of(sid):
+            return _econ.get(int(sid), (0.0, 0.0))[0] if pd.notna(sid) else 0.0
+        def _me1_of(sid):
+            return _econ.get(int(sid), (0.0, 0.0))[1] if pd.notna(sid) else 0.0
+        # Repartir por ítem (por valor dentro de la orden) para el margen por SKU.
         _ord_rev = df.groupby("order_id")["rev_item"].transform("sum").replace(0, float("nan"))
-        df["ship_item"] = (df["_ship_order"] * (df["rev_item"] / _ord_rev)).fillna(0.0)
-        envios_sofar = float(df["ship_item"].sum())
+        df["ship_item"] = (df["shipping_id"].map(_me2_of) * (df["rev_item"] / _ord_rev)).fillna(0.0)
+        df["me1_item"]  = (df["shipping_id"].map(_me1_of) * (df["rev_item"] / _ord_rev)).fillna(0.0)
+        envios_sofar   = float(df["ship_item"].sum())   # ME2 a tu cargo
+        me1_ingreso_sofar = float(df["me1_item"].sum())  # ingreso bruto ME1
 
-        # Diagnóstico: top SKU por facturación, con costo, envío a tu cargo y
-        # margen real (venta − costo − envío).
+        # Diagnóstico: top SKU por facturación, con costo, envío ME2 a tu cargo,
+        # ganancia de envío ME1 y margen real.
+        me1_keep = 1.0 - float(me1_cost_pct or 0.0) / 100.0   # % que te queda del ME1
         _diag = []
         if bool(df["matched"].any()):
             g = (df[df["matched"]]
                  .groupby(["cod", "item_title"], as_index=False)
                  .agg(rev=("rev_item", "sum"), cogs=("cogs_item", "sum"),
-                      ship=("ship_item", "sum"), un=("quantity", "sum")))
+                      ship=("ship_item", "sum"), me1=("me1_item", "sum"),
+                      un=("quantity", "sum")))
             g = g.sort_values("rev", ascending=False).head(20)
             for _, r in g.iterrows():
                 _rev = float(r["rev"]); _cg = float(r["cogs"]); _sh = float(r["ship"])
-                _mg = (_rev - _cg - _sh) / _rev * 100 if _rev > 0 else None
+                _m1g = float(r["me1"]) * me1_keep
+                _mg = (_rev - _cg - _sh + _m1g) / _rev * 100 if _rev > 0 else None
                 _diag.append({
                     "item": str(r["item_title"])[:60], "cod": r["cod"],
                     "rev": round(_rev), "cogs": round(_cg), "ship": round(_sh),
-                    "margen_pct": round(_mg, 1) if _mg is not None else None,
+                    "me1": round(_m1g), "margen_pct": round(_mg, 1) if _mg is not None else None,
                     "un": int(r["un"]),
                 })
 
         # Proyección a fin de mes (escala por facturación).
         scale = fact_proy / rev_sofar if rev_sofar > 0 else 1.0
         neto_mp   = fact_proy * NETO_MP_RATE
-        # COGS AUTOMÁTICO: ratio real medido por SKU, extrapolado a la
-        # facturación proyectada. Sin markup. Con cobertura <100% se asume que
-        # lo no cubierto tiene el mismo ratio real (la cobertura se muestra).
         cogs_proy = cogs_ratio_real * fact_proy
-        envios_proy = envios_sofar * scale
+        envios_proy   = envios_sofar * scale
+        me1_gain_proy = me1_ingreso_sofar * me1_keep * scale   # ganancia neta ME1
         ads = float(ads or 0.0)
 
-        renta = neto_mp - cogs_proy - ads - envios_proy
+        renta = neto_mp - cogs_proy - ads - envios_proy + me1_gain_proy
         margen = renta / fact_proy if fact_proy > 0 else 0.0
 
         return {
             "mes":              forecast.get("month"),
             "tc":               tc,
+            "me1_cost_pct":     round(float(me1_cost_pct or 0.0), 1),
             "facturacion":      round(fact_proy, 2),
             "neto_mp":          round(neto_mp, 2),
             "comision_imp":     round(fact_proy * (1 - NETO_MP_RATE), 2),
             "cogs":             round(cogs_proy, 2),
             "ads":              round(ads, 2),
             "envios":           round(envios_proy, 2),
+            "me1_gain":         round(me1_gain_proy, 2),
             "renta":            round(renta, 2),
             "margen_pct":       round(margen * 100, 1),
             "cogs_ratio_pct":   round(cogs_ratio_real * 100, 1),
             "cogs_ratio_real_pct": round(cogs_ratio_real * 100, 1),
             "match_coverage_pct": round(coverage * 100, 1),
             "envios_sofar":     round(envios_sofar, 2),
+            "me1_ingreso_sofar": round(me1_ingreso_sofar, 2),
             "rev_sofar":        round(rev_sofar, 2),
             "cogs_usd_matched": round(cogs_usd_matched, 2),   # base para recalcular con otro TC
             "rev_matched":      round(rev_matched, 2),
@@ -331,57 +337,82 @@ class RentaCalculator:
     # ─── Cache en Dropbox (el cálculo pega N veces a /shipments) ───────
 
     @staticmethod
-    def _apply_params(res: dict, ads: float, tc: float) -> dict:
-        """Re-deriva la parte BARATA (COGS al TC actual, ADS, renta) sobre una
-        base ya calculada (facturación, neto, envíos, costo USD matcheado).
-        Evita re-barrer envíos cuando sólo cambian TC o ADS."""
+    def _apply_params(res: dict, ads: float, tc: float, fact_live: float = None,
+                      me1_cost_pct: float = None) -> dict:
+        """Re-deriva la parte BARATA sobre la base cara ya calculada
+        (costo USD matcheado, envíos ME2 e ingreso ME1 a la fecha, ventas
+        cubiertas). Permite cambiar TC/ADS/costo-ME1 y usar la FACTURACIÓN VIVA
+        del pronóstico (fact_live) para que todo se re-escale solo. No re-barre
+        envíos."""
         r = dict(res)
-        fact        = float(r.get("facturacion", 0.0))
-        neto        = float(r.get("neto_mp", 0.0))
-        envios      = float(r.get("envios", 0.0))               # ya proyectado
+        fact        = float(fact_live) if fact_live else float(r.get("facturacion", 0.0))
+        rev_sofar   = float(r.get("rev_sofar", 0.0)) or 1.0
+        envios_sofar = float(r.get("envios_sofar", 0.0))
+        me1_ing_sofar = float(r.get("me1_ingreso_sofar", 0.0))
         rev_matched = float(r.get("rev_matched", 0.0))
         cogs_usd_m  = float(r.get("cogs_usd_matched", 0.0))
         ads = float(ads or 0.0); tc = float(tc or DEFAULT_TC)
-        # Ratio COGS real al TC actual (costo USD × TC / venta real cubierta).
+        if me1_cost_pct is None:
+            me1_cost_pct = float(r.get("me1_cost_pct", 45.0))
+        me1_keep = 1.0 - float(me1_cost_pct) / 100.0
+        scale = fact / rev_sofar if rev_sofar > 0 else 1.0
+        neto = fact * NETO_MP_RATE
         cogs_ratio = (cogs_usd_m * tc / rev_matched) if rev_matched > 0 else 0.0
         cogs  = cogs_ratio * fact
-        renta = neto - cogs - ads - envios
-        r["tc"]                 = round(tc, 2)
-        r["ads"]                = round(ads, 2)
-        r["cogs"]               = round(cogs, 2)
-        r["cogs_ratio_pct"]     = round(cogs_ratio * 100, 1)
+        envios = envios_sofar * scale
+        me1_gain = me1_ing_sofar * me1_keep * scale
+        renta = neto - cogs - ads - envios + me1_gain
+        r["tc"]                  = round(tc, 2)
+        r["ads"]                 = round(ads, 2)
+        r["me1_cost_pct"]        = round(float(me1_cost_pct), 1)
+        r["facturacion"]         = round(fact, 2)
+        r["neto_mp"]             = round(neto, 2)
+        r["comision_imp"]        = round(fact * (1 - NETO_MP_RATE), 2)
+        r["cogs"]                = round(cogs, 2)
+        r["cogs_ratio_pct"]      = round(cogs_ratio * 100, 1)
         r["cogs_ratio_real_pct"] = round(cogs_ratio * 100, 1)
-        r["renta"]              = round(renta, 2)
-        r["margen_pct"]         = round((renta / fact * 100) if fact > 0 else 0, 1)
+        r["envios"]              = round(envios, 2)
+        r["me1_gain"]            = round(me1_gain, 2)
+        r["renta"]               = round(renta, 2)
+        r["margen_pct"]          = round((renta / fact * 100) if fact > 0 else 0, 1)
         return r
 
-    def peek_cache(self, tc: float = DEFAULT_TC, ads: float = 0.0):
+    @staticmethod
+    def _fact_of(forecast: dict):
+        """Facturación proyectada viva del pronóstico, o None si no sirve."""
+        if forecast and "error" not in forecast and forecast.get("forecast_revenue"):
+            return float(forecast["forecast_revenue"])
+        return None
+
+    def peek_cache(self, tc: float = DEFAULT_TC, ads: float = 0.0,
+                   me1_cost_pct: float = 45.0, forecast: dict = None):
         """Lee el cache SIN calcular (carga normal del dashboard) y re-deriva
-        COGS/ADS para los parámetros actuales. (None, None) si no hay cache."""
+        con la facturación viva del pronóstico. (None, None) si no hay cache."""
         try:
             c = self.storage.load_json(RENTA_CACHE_PATH)
             if c and c.get("ts") and c.get("result") and "cogs_usd_matched" in c["result"]:
                 age = (datetime.now().timestamp() - c["ts"]) / 3600.0
-                return self._apply_params(c["result"], ads, tc), age
+                return self._apply_params(c["result"], ads, tc, self._fact_of(forecast), me1_cost_pct), age
         except Exception:
             pass
         return None, None
 
     def get_renta_cached(self, max_age_h: float = 12, force: bool = False,
                          tc: float = DEFAULT_TC, ads: float = 0.0,
-                         forecast: dict = None):
+                         me1_cost_pct: float = 45.0, forecast: dict = None):
         """Devuelve (renta, edad_horas). El barrido de envíos (caro) sólo corre
-        si force=True o si el cache venció; TC/ADS se recalculan al vuelo."""
+        si force=True o si el cache venció; TC/ADS/costo-ME1 y la facturación
+        viva se recalculan al vuelo."""
         if not force:
             try:
                 c = self.storage.load_json(RENTA_CACHE_PATH)
                 if c and c.get("ts") and c.get("result") and "cogs_usd_matched" in c["result"]:
                     age = (datetime.now().timestamp() - c["ts"]) / 3600.0
                     if age < max_age_h:
-                        return self._apply_params(c["result"], ads, tc), age
+                        return self._apply_params(c["result"], ads, tc, self._fact_of(forecast), me1_cost_pct), age
             except Exception:
                 pass
-        res = self.get_renta(tc=tc, ads=ads, forecast=forecast)
+        res = self.get_renta(tc=tc, ads=ads, me1_cost_pct=me1_cost_pct, forecast=forecast)
         if "error" not in res:
             try:
                 self.storage.save_json(

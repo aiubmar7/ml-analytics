@@ -631,7 +631,7 @@ if page == "🏠 Resumen":
                    "(real por SKU) − publicidad − envíos ME2. Sólo canal ML, mes proyectado a fin de mes.")
         rc = clients["renta"]
         _rp = rc.load_params()
-        rpc1, rpc2 = st.columns(2)
+        rpc1, rpc2, rpc3 = st.columns(3)
         with rpc1:
             _ads = st.number_input("Publicidad del mes — ADS (UYU)", min_value=0.0,
                                    value=float(_rp["ads"]), step=50000.0, format="%.0f",
@@ -641,8 +641,14 @@ if page == "🏠 Resumen":
             _tc = st.number_input("TC del mes (USD→UYU)", min_value=1.0,
                                   value=float(_rp["tc"]), step=0.05, format="%.2f",
                                   help="Tipo de cambio con que se valúa el costo en USD del listado.")
-        if abs(_tc - _rp["tc"]) > 1e-6 or abs(_ads - _rp["ads"]) > 0.5:
-            rc.save_params(_tc, _ads)
+        with rpc3:
+            _me1 = st.number_input("Costo despacho ME1 (%)", min_value=0.0, max_value=100.0,
+                                   value=float(_rp.get("me1_cost", 45.0)), step=5.0, format="%.0f",
+                                   help="Lo que te cuesta despachar un ME1 como % de lo que paga el "
+                                        "comprador (DAC/correo). El resto es tu ganancia de envío ME1, "
+                                        "que se suma a la renta.")
+        if abs(_tc - _rp["tc"]) > 1e-6 or abs(_ads - _rp["ads"]) > 0.5 or abs(_me1 - _rp.get("me1_cost", 45.0)) > 1e-6:
+            rc.save_params(_tc, _ads, _me1)
 
         # Cargador del listado de costos: lo guarda en Dropbox con la conexión
         # de la app (no depende del sync del Dropbox de escritorio).
@@ -681,9 +687,10 @@ if page == "🏠 Resumen":
                                      "costea cada SKU. Queda cacheado; cambiar TC/ADS se recalcula al instante.")
         if _recalc:
             with st.spinner("Costeando por SKU y recorriendo envíos del mes… (~40 s)"):
-                _renta, _age = rc.get_renta_cached(tc=_tc, ads=_ads, forecast=forecast, force=True)
+                _renta, _age = rc.get_renta_cached(tc=_tc, ads=_ads, me1_cost_pct=_me1,
+                                                   forecast=forecast, force=True)
         else:
-            _renta, _age = rc.peek_cache(tc=_tc, ads=_ads)
+            _renta, _age = rc.peek_cache(tc=_tc, ads=_ads, me1_cost_pct=_me1, forecast=forecast)
 
         if _renta is None:
             st.caption("Todavía no calculaste la renta. Tocá **Calcular / actualizar renta** (una vez).")
@@ -703,19 +710,24 @@ if page == "🏠 Resumen":
             with _acol:
                 st.caption(f"Actualizado hace {_age:.0f} h · costeo real por SKU "
                            f"(cobertura {_cov0:.0f}%) · envíos reales de la API")
-            rm1, rm2, rm3, rm4 = st.columns(4)
+            rm1, rm2, rm3, rm4, rm5 = st.columns(5)
             rm1.metric("Facturación proyectada", fmt_currency(_renta["facturacion"]))
             rm2.metric("Neto MP (×0,81)", fmt_currency(_renta["neto_mp"]))
             rm3.metric("Renta neta", fmt_currency(_renta["renta"]),
                        delta=f"{_renta['margen_pct']:.1f}% margen")
-            rm4.metric("Envíos ME2 (mes)", fmt_currency(_renta["envios"]))
+            rm4.metric("Envíos ME2 (tu costo)", fmt_currency(_renta["envios"]))
+            rm5.metric("Ganancia envío ME1", fmt_currency(_renta.get("me1_gain", 0)),
+                       help="Lo que ganás en envíos ME1 (el comprador paga el envío y vos despachás "
+                            "más barato). Se suma a la renta.")
             _comp = pd.DataFrame({
-                "Concepto": ["Costo mercadería", "Comisión+imp.", "Publicidad", "Envíos", "Renta neta"],
+                "Concepto": ["Costo mercadería", "Comisión+imp.", "Publicidad", "Envíos ME2",
+                             "Gan. ME1", "Renta neta"],
                 "Monto":    [_renta["cogs"], _renta["comision_imp"], _renta["ads"],
-                             _renta["envios"], _renta["renta"]],
+                             _renta["envios"], _renta.get("me1_gain", 0), _renta["renta"]],
             })
             _figr = px.bar(_comp, x="Concepto", y="Monto", color="Concepto",
-                           color_discrete_sequence=["#3483FA", "#FFC043", "#9B8CFF", "#FF6B6B", "#14b47c"])
+                           color_discrete_sequence=["#3483FA", "#FFC043", "#9B8CFF", "#FF6B6B",
+                                                    "#49C5B6", "#14b47c"])
             _figr.update_layout(height=300, showlegend=False, yaxis_title="UYU",
                                 xaxis_title=None, xaxis_tickangle=-15)
             st.plotly_chart(_figr, use_container_width=True)
@@ -736,13 +748,13 @@ if page == "🏠 Resumen":
                     _ddf = pd.DataFrame(_diag).rename(columns={
                         "item": "Producto", "cod": "SKU", "un": "Unid.",
                         "rev": "Facturación", "cogs": "Costo", "ship": "Envío ME2",
-                        "margen_pct": "Margen %"})
+                        "me1": "Gan. ME1", "margen_pct": "Margen %"})
                     _show = [c for c in ["Producto", "SKU", "Unid.", "Facturación", "Costo",
-                                         "Envío ME2", "Margen %"] if c in _ddf.columns]
+                                         "Envío ME2", "Gan. ME1", "Margen %"] if c in _ddf.columns]
                     st.dataframe(_ddf[_show], use_container_width=True, hide_index=True)
                     st.caption("Margen real = venta − costo real − **envío ME2 que pagás vos** "
-                               "(0 si el envío lo paga el comprador). Si un SKU da margen muy bajo o "
-                               "negativo, revisá su costo o su política de envío.")
+                               "+ **ganancia de envío ME1** (comprador paga, vos despachás más barato). "
+                               "Si un SKU da margen muy bajo o negativo, revisá su costo o su envío.")
 
     # ── Backtest AUTOMÁTICO + optimización de pesos MANUAL ────────
     st.markdown("---")

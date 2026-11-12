@@ -78,6 +78,28 @@ class MySalesExtractor:
         listc = float(opt.get("list_cost") or 0)
         return listc if buyer == 0 else 0.0
 
+    def shipment_econ(self, shipping_id) -> tuple:
+        """Economía de envío de una orden: (me2_costo_vendedor, me1_ingreso).
+        - ME2 con envío gratis (mode=='me2', comprador cost==0): el vendedor
+          paga list_cost -> (list_cost, 0).
+        - ME2 que paga el comprador: (0, 0).
+        - ME1 (mode!='me2'): el comprador le paga el envío al vendedor -> ese
+          monto es INGRESO de envío -> (0, buyer_cost). El costo real de
+          despacho (lo que el vendedor paga al correo) se aplica como % aparte.
+        1 consulta /shipments/{id}."""
+        if not shipping_id:
+            return (0.0, 0.0)
+        try:
+            s = self.client.get(f"/shipments/{shipping_id}")
+        except Exception:
+            return (0.0, 0.0)
+        opt   = s.get("shipping_option") or {}
+        buyer = float(opt.get("cost") or 0)
+        listc = float(opt.get("list_cost") or 0)
+        if s.get("mode") == "me2":
+            return (listc if buyer == 0 else 0.0, 0.0)
+        return (0.0, buyer)                              # ME1: ingreso de envío
+
     def get_orders(self, days_back: int = DEFAULT_DAYS_BACK, with_shipping: bool = False) -> pd.DataFrame:
         # Cache con TTL de 10 min: evita re-bajar la misma data en cada
         # carga/refresco de la página (lo que martillaba la API y
