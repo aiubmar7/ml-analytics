@@ -75,6 +75,23 @@ def _key_tokens(norm_title: str) -> set:
             toks.add(t)
     return toks
 
+def _strong_tokens(norm_title: str) -> set:
+    """Identificadores FUERTES: códigos de modelo / nros de parte. Excluye el
+    BTU (12k/9k), que es débil (muchos aires distintos comparten '12k' y
+    generaban falsos positivos). Un match exige compartir al menos uno de
+    estos (o dos key-tokens corroborados)."""
+    toks = set()
+    for t in norm_title.split():
+        if t in _STOP or len(t) < 3:
+            continue
+        if re.fullmatch(r"\d{1,2}k", t):          # BTU => débil, no fuerte
+            continue
+        has_d = any(c.isdigit() for c in t)
+        has_a = any(c.isalpha() for c in t)
+        if (has_d and has_a and len(t) >= 4) or (t.isdigit() and len(t) >= 4):
+            toks.add(t)
+    return toks
+
 def _all_tokens(norm_title: str) -> set:
     return {t for t in norm_title.split() if t not in _STOP and len(t) >= 3}
 
@@ -96,42 +113,50 @@ class RentaCalculator:
             self._cost_df = pd.DataFrame(columns=["codigo","descripcion","grupo","costo_usd"])
             return self._cost_df
         df = df[df["costo_usd"] > 0].copy().reset_index(drop=True)
-        df["_norm"] = df["descripcion"].map(_norm)
-        df["_keys"] = df["_norm"].map(_key_tokens)
-        df["_toks"] = df["_norm"].map(_all_tokens)
-        # índice invertido por key-token para no escanear 700 filas por venta
+        df["_norm"]   = df["descripcion"].map(_norm)
+        df["_keys"]   = df["_norm"].map(_key_tokens)
+        df["_strong"] = df["_norm"].map(_strong_tokens)
+        df["_toks"]   = df["_norm"].map(_all_tokens)
+        # índice invertido por token FUERTE: el candidato debe compartir un
+        # código de modelo / nro de parte, no un simple "12k".
         idx = {}
-        for pos, keys in enumerate(df["_keys"]):
-            for k in keys:
+        for pos, strong in enumerate(df["_strong"]):
+            for k in strong:
                 idx.setdefault(k, set()).add(pos)
         self._cost_df, self._cost_idx = df, idx
         return df
 
     def match_cost(self, item_title: str):
-        """Devuelve (costo_usd, codigo) del mejor match, o (None, None)."""
+        """Devuelve (costo_usd, codigo) del mejor match, o (None, None).
+        Exige compartir al menos un token FUERTE (código/modelo); el BTU y los
+        tokens genéricos sólo desempatan. Evita los falsos positivos que
+        inflaban el COGS."""
         df = self.load_cost_list()
         if df.empty:
             return None, None
         n = _norm(item_title)
-        keys = _key_tokens(n)
-        toks = _all_tokens(n)
-        # candidatos: filas que comparten al menos un key-token
+        strong = _strong_tokens(n)
+        keys   = _key_tokens(n)
+        toks   = _all_tokens(n)
+        if not strong:
+            return None, None
+        # candidatos: filas que comparten al menos un token fuerte
         cands = set()
-        for k in keys:
+        for k in strong:
             cands |= self._cost_idx.get(k, set())
         if not cands:
             return None, None
-        best, best_score = None, 0.0
+        best, best_score, best_strong = None, 0.0, 0
         for pos in cands:
             row = df.iloc[pos]
-            shared_keys = len(keys & row["_keys"])
-            shared_toks = len(toks & row["_toks"])
-            # el peso fuerte lo dan los key-tokens (modelo/BTU)
-            score = shared_keys * 3 + shared_toks
+            s_strong = len(strong & row["_strong"])
+            s_keys   = len(keys   & row["_keys"])
+            s_toks   = len(toks   & row["_toks"])
+            score = s_strong * 10 + s_keys * 2 + s_toks
             if score > best_score:
-                best, best_score = row, score
-        # umbral: al menos un key-token en común
-        if best is not None and best_score >= 3:
+                best, best_score, best_strong = row, score, s_strong
+        # exigir al menos UN token fuerte compartido
+        if best is not None and best_strong >= 1:
             return float(best["costo_usd"]), str(best["codigo"])
         return None, None
 
@@ -162,11 +187,13 @@ class RentaCalculator:
             p = self.storage.load_json(RENTA_PARAMS_PATH) or {}
         except Exception:
             p = {}
-        return {"tc": float(p.get("tc", DEFAULT_TC)), "ads": float(p.get("ads", 0.0))}
+        return {"tc": float(p.get("tc", DEFAULT_TC)), "ads": float(p.get("ads", 0.0)),
+                "markup": float(p.get("markup", 52.0))}
 
-    def save_params(self, tc: float, ads: float) -> None:
+    def save_params(self, tc: float, ads: float, markup: float = 52.0) -> None:
         try:
             self.storage.save_json({"tc": float(tc), "ads": float(ads),
+                                    "markup": float(markup),
                                     "updated_at": datetime.now().isoformat()},
                                    RENTA_PARAMS_PATH)
         except Exception as e:
@@ -175,9 +202,13 @@ class RentaCalculator:
     # ─── Cálculo principal ────────────────────────────────────────────
 
     def get_renta(self, as_of=None, tc: float = DEFAULT_TC, ads: float = 0.0,
-                  forecast: dict = None) -> dict:
-        """Renta del mes en curso (canal ML). Hace UNA pasada a la API con
-        envíos: de ahí salen COGS (match de costos) y envíos juntos."""
+                  markup_pct: float = 52.0, forecast: dict = None) -> dict:
+        """Renta del mes en curso (canal ML).
+
+        COGS de cabecera = markup promedio (markup_pct, default +52% — validado
+        contra el listado de costos). Es estable. El costeo por match de
+        producto se calcula igual pero sólo como DIAGNÓSTICO/referencia, porque
+        ML y el listado nombran distinto los productos y el match es ruidoso."""
         if forecast is None or "error" in (forecast or {}):
             forecast = self.sales.get_monthly_forecast(as_of=as_of)
         if "error" in forecast:
@@ -208,33 +239,62 @@ class RentaCalculator:
             if t not in cache:
                 cache[t] = self.match_cost(t)
             return cache[t]
-        costos, matched = [], []
-        for t, q in zip(df["item_title"], df["quantity"]):
-            c, _cod = _cost(t)
+        costos, matched, codes = [], [], []
+        for t, q, up in zip(df["item_title"], df["quantity"], df["unit_price"]):
+            c, cod = _cost(t)
+            rev_i = float(up) * float(q)
             if c is None:
-                costos.append(0.0); matched.append(False)
+                costos.append(0.0); matched.append(False); codes.append(None)
+                continue
+            cogs_i = c * q * tc                      # COGS del ítem en UYU
+            # GUARDIA: si el costo supera a la venta, es casi seguro un mal
+            # match (no se vende a pérdida) → no lo contamos: ni infla el COGS
+            # ni suma como cubierto.
+            if cogs_i > rev_i * 1.05:
+                costos.append(0.0); matched.append(False); codes.append(None)
             else:
-                costos.append(c * q * tc); matched.append(True)   # COGS en UYU
+                costos.append(cogs_i); matched.append(True); codes.append(cod)
         df["cogs_item"] = costos
         df["matched"]   = matched
+        df["cod"]       = codes
 
-        rev_total   = float(df["rev_item"].sum())
-        rev_matched = float(df.loc[df["matched"], "rev_item"].sum())
+        rev_total    = float(df["rev_item"].sum())
+        rev_matched  = float(df.loc[df["matched"], "rev_item"].sum())
         cogs_matched = float(df.loc[df["matched"], "cogs_item"].sum())
-        coverage = rev_matched / rev_total if rev_total > 0 else 0.0
+        coverage   = rev_matched / rev_total if rev_total > 0 else 0.0
         cogs_ratio = cogs_matched / rev_matched if rev_matched > 0 else 0.0
 
-        # Envíos a la fecha: 1 consulta /shipments por ORDEN (shipping_id único
-        # por orden), traídas EN PARALELO. Cada sid mapea a una orden, así que
-        # el total es la suma directa de los costos por envío.
-        _sids = [s for s in df["shipping_id"].dropna().unique().tolist() if s]
+        # Diagnóstico: top ítems matcheados por facturación, con su markup real
+        # (para poder auditar la calidad del match).
+        _diag = []
+        if bool(df["matched"].any()):
+            g = (df[df["matched"]]
+                 .groupby(["item_title", "cod"], as_index=False)
+                 .agg(rev=("rev_item", "sum"), cogs=("cogs_item", "sum"),
+                      un=("quantity", "sum")))
+            g["markup"] = (g["rev"] / g["cogs"] - 1) * 100
+            g = g.sort_values("rev", ascending=False).head(15)
+            for _, r in g.iterrows():
+                _diag.append({
+                    "item": str(r["item_title"])[:60], "cod": r["cod"],
+                    "rev": round(float(r["rev"])), "cogs": round(float(r["cogs"])),
+                    "markup_pct": round(float(r["markup"]), 1), "un": int(r["un"]),
+                })
+
+        # Envíos a la fecha: 1 consulta /shipments por ORDEN, en PARALELO. Los
+        # shipping_id salen del DataFrame como float (pandas), hay que pasarlos
+        # a int o la URL /shipments/123.0 da 404 (bug que ponía envíos en 0).
+        _sids = [int(s) for s in df["shipping_id"].dropna().unique().tolist()]
         _ship_map = self._fetch_shipping_costs(_sids)
         envios_sofar = float(sum(_ship_map.values()))
 
         # Proyección a fin de mes (escala por facturación).
         scale = fact_proy / rev_sofar if rev_sofar > 0 else 1.0
         neto_mp   = fact_proy * NETO_MP_RATE
-        cogs_proy = cogs_ratio * fact_proy
+        # COGS de CABECERA: markup promedio (estable). cogs = fact / (1+markup).
+        markup_pct = float(markup_pct or 52.0)
+        cogs_ratio_markup = 1.0 / (1.0 + markup_pct / 100.0)
+        cogs_proy = cogs_ratio_markup * fact_proy
         envios_proy = envios_sofar * scale
         ads = float(ads or 0.0)
 
@@ -244,6 +304,7 @@ class RentaCalculator:
         return {
             "mes":              forecast.get("month"),
             "tc":               tc,
+            "markup_pct":       round(markup_pct, 1),
             "facturacion":      round(fact_proy, 2),
             "neto_mp":          round(neto_mp, 2),
             "comision_imp":     round(fact_proy * (1 - NETO_MP_RATE), 2),
@@ -252,49 +313,73 @@ class RentaCalculator:
             "envios":           round(envios_proy, 2),
             "renta":            round(renta, 2),
             "margen_pct":       round(margen * 100, 1),
-            "cogs_ratio_pct":   round(cogs_ratio * 100, 1),
+            "cogs_ratio_pct":   round(cogs_ratio_markup * 100, 1),
+            "cogs_ratio_live_pct": round(cogs_ratio * 100, 1),   # match real (diagnóstico)
             "match_coverage_pct": round(coverage * 100, 1),
             "envios_sofar":     round(envios_sofar, 2),
             "rev_sofar":        round(rev_sofar, 2),
             "n_items_match":    int(df["matched"].sum()),
             "n_items_total":    int(len(df)),
+            "rev_matched":      round(rev_matched, 2),
+            "rev_total":        round(rev_total, 2),
+            "diagnostico":      _diag,
             "computed_at":      datetime.now().isoformat(),
         }
 
     # ─── Cache en Dropbox (el cálculo pega N veces a /shipments) ───────
 
-    def peek_cache(self, tc: float = DEFAULT_TC, ads: float = 0.0):
-        """Lee el cache SIN calcular (para la carga normal del dashboard).
-        Devuelve (result, edad_horas) o (None, None) si no hay cache válido
-        para ese TC/ADS."""
+    @staticmethod
+    def _apply_params(res: dict, ads: float, markup: float) -> dict:
+        """Re-deriva la parte BARATA (COGS por markup, ADS, renta) sobre una
+        base ya calculada (facturación, neto, envíos). Evita re-barrer envíos
+        cuando sólo cambian markup o ADS."""
+        r = dict(res)
+        fact   = float(r.get("facturacion", 0.0))
+        neto   = float(r.get("neto_mp", 0.0))
+        envios = float(r.get("envios", 0.0))          # ya proyectado
+        markup = float(markup or 52.0); ads = float(ads or 0.0)
+        cogs_ratio = 1.0 / (1.0 + markup / 100.0)
+        cogs  = cogs_ratio * fact
+        renta = neto - cogs - ads - envios
+        r["markup_pct"]     = round(markup, 1)
+        r["ads"]            = round(ads, 2)
+        r["cogs"]           = round(cogs, 2)
+        r["cogs_ratio_pct"] = round(cogs_ratio * 100, 1)
+        r["renta"]          = round(renta, 2)
+        r["margen_pct"]     = round((renta / fact * 100) if fact > 0 else 0, 1)
+        return r
+
+    def peek_cache(self, tc: float = DEFAULT_TC, ads: float = 0.0, markup: float = 52.0):
+        """Lee el cache SIN calcular (carga normal del dashboard) y re-deriva
+        COGS/ADS para los parámetros actuales. (None, None) si no hay cache."""
         try:
             c = self.storage.load_json(RENTA_CACHE_PATH)
-            if c and c.get("ts") and c.get("tc") == tc and c.get("ads") == ads:
+            if c and c.get("ts") and c.get("result"):
                 age = (datetime.now().timestamp() - c["ts"]) / 3600.0
-                return c.get("result", {}), age
+                return self._apply_params(c["result"], ads, markup), age
         except Exception:
             pass
         return None, None
 
     def get_renta_cached(self, max_age_h: float = 12, force: bool = False,
                          tc: float = DEFAULT_TC, ads: float = 0.0,
-                         forecast: dict = None):
-        """Devuelve (renta, edad_horas). Recalcula solo si no hay cache, si
-        venció, o si cambian TC/ADS (el cálculo es caro: ~N /shipments)."""
+                         markup: float = 52.0, forecast: dict = None):
+        """Devuelve (renta, edad_horas). El barrido de envíos (caro) sólo corre
+        si force=True o si el cache venció; markup/ADS se recalculan al vuelo."""
         if not force:
             try:
                 c = self.storage.load_json(RENTA_CACHE_PATH)
-                if c and c.get("ts") and c.get("tc") == tc and c.get("ads") == ads:
+                if c and c.get("ts") and c.get("result"):
                     age = (datetime.now().timestamp() - c["ts"]) / 3600.0
                     if age < max_age_h:
-                        return c.get("result", {}), age
+                        return self._apply_params(c["result"], ads, markup), age
             except Exception:
                 pass
-        res = self.get_renta(tc=tc, ads=ads, forecast=forecast)
+        res = self.get_renta(tc=tc, ads=ads, markup=markup, forecast=forecast)
         if "error" not in res:
             try:
                 self.storage.save_json(
-                    {"ts": datetime.now().timestamp(), "tc": tc, "ads": ads, "result": res},
+                    {"ts": datetime.now().timestamp(), "result": res},
                     RENTA_CACHE_PATH)
             except Exception:
                 pass

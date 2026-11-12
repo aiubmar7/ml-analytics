@@ -631,37 +631,43 @@ if page == "🏠 Resumen":
                    "− publicidad − envíos ME2. Sólo canal ML, mes proyectado a fin de mes.")
         rc = clients["renta"]
         _rp = rc.load_params()
-        rpc1, rpc2 = st.columns(2)
+        rpc1, rpc2, rpc3 = st.columns(3)
         with rpc1:
-            _tc = st.number_input("TC del mes (USD→UYU)", min_value=1.0,
-                                  value=float(_rp["tc"]), step=0.05, format="%.2f",
-                                  help="Tipo de cambio con que se valúa el costo de mercadería (USD).")
+            _mk = st.number_input("Markup promedio (%)", min_value=1.0,
+                                  value=float(_rp.get("markup", 52.0)), step=1.0, format="%.0f",
+                                  help="Margen sobre costo con que se estima el COGS "
+                                       "(markup +52% ⇒ costo = 66% de la venta). Validado con tu listado.")
         with rpc2:
             _ads = st.number_input("Publicidad del mes — ADS (UYU)", min_value=0.0,
                                    value=float(_rp["ads"]), step=50000.0, format="%.0f",
                                    help="Inversión en Product Ads del mes. Cargala vos; la app no la ve.")
-        if abs(_tc - _rp["tc"]) > 1e-6 or abs(_ads - _rp["ads"]) > 0.5:
-            rc.save_params(_tc, _ads)
+        with rpc3:
+            _tc = st.number_input("TC del mes (USD→UYU)", min_value=1.0,
+                                  value=float(_rp["tc"]), step=0.05, format="%.2f",
+                                  help="Tipo de cambio (sólo afecta el costeo por producto del diagnóstico).")
+        if abs(_tc - _rp["tc"]) > 1e-6 or abs(_ads - _rp["ads"]) > 0.5 or abs(_mk - _rp.get("markup", 52.0)) > 1e-6:
+            rc.save_params(_tc, _ads, _mk)
 
         _bcol, _acol = st.columns([1, 2])
         with _bcol:
             _recalc = st.button("🔄 Calcular / actualizar renta", type="secondary",
-                                help="Costea las ventas del mes y recorre los envíos en la API "
-                                     "(~1 consulta por orden). Tarda unos segundos; queda cacheado.")
+                                help="Recorre los envíos del mes en la API (~1 consulta por orden, "
+                                     "en paralelo). Tarda ~40 s; queda cacheado. Cambiar markup/ADS "
+                                     "no re-corre esto, se recalcula al instante.")
         if _recalc:
-            with st.spinner("Costeando ventas y recorriendo envíos del mes… (unos segundos)"):
-                _renta, _age = rc.get_renta_cached(tc=_tc, ads=_ads, forecast=forecast, force=True)
+            with st.spinner("Costeando ventas y recorriendo envíos del mes… (~40 s)"):
+                _renta, _age = rc.get_renta_cached(tc=_tc, ads=_ads, markup=_mk, forecast=forecast, force=True)
         else:
-            _renta, _age = rc.peek_cache(tc=_tc, ads=_ads)
+            _renta, _age = rc.peek_cache(tc=_tc, ads=_ads, markup=_mk)
 
         if _renta is None:
-            st.caption("Todavía no calculaste la renta para este TC/ADS. Tocá **Calcular / actualizar renta**.")
+            st.caption("Todavía no calculaste la renta. Tocá **Calcular / actualizar renta** (una vez).")
         elif "error" in _renta:
             st.caption(f"💵 Renta: {_renta['error']}. Probá **Calcular / actualizar renta**.")
         else:
             with _acol:
-                st.caption(f"Actualizado hace {_age:.0f} h · cobertura de costeo "
-                           f"{_renta['match_coverage_pct']:.0f}% · TC {_renta['tc']:.2f}")
+                st.caption(f"Actualizado hace {_age:.0f} h · COGS por markup "
+                           f"+{_renta.get('markup_pct', 52):.0f}% · envíos reales de la API")
             rm1, rm2, rm3, rm4 = st.columns(4)
             rm1.metric("Facturación proyectada", fmt_currency(_renta["facturacion"]))
             rm2.metric("Neto MP (×0,81)", fmt_currency(_renta["neto_mp"]))
@@ -679,14 +685,26 @@ if page == "🏠 Resumen":
                                 xaxis_title=None, xaxis_tickangle=-15)
             st.plotly_chart(_figr, use_container_width=True)
             st.caption(
-                f"COGS/facturación {_renta['cogs_ratio_pct']:.0f}% (sobre {_renta['n_items_match']} de "
-                f"{_renta['n_items_total']} ítems matcheados con el listado de costos). "
-                f"Envíos del mes a hoy: {fmt_currency(_renta['envios_sofar'])}. "
+                f"COGS = facturación ÷ (1 + markup). Con +{_renta.get('markup_pct', 52):.0f}% ⇒ "
+                f"costo {_renta['cogs_ratio_pct']:.0f}% de la venta. "
+                f"Envíos del mes a hoy: {fmt_md(_renta['envios_sofar'])} (reales, API). "
                 f"Montos netos y proyectados a fin de mes."
             )
-            if _renta["match_coverage_pct"] < 60:
-                st.info("ℹ️ Cobertura de costeo parcial: el COGS se estima con el margen de los ítems "
-                        "que matchean con el listado. A mayor cobertura, más preciso el número.")
+            _diag = _renta.get("diagnostico") or []
+            if _diag:
+                with st.expander("🔎 Costeo por producto (diagnóstico, en afinamiento) — "
+                                 f"match {_renta['match_coverage_pct']:.0f}% · "
+                                 f"COGS real matcheado {_renta.get('cogs_ratio_live_pct', 0):.0f}%"):
+                    st.caption("Referencia: el costeo por match todavía es ruidoso porque ML y tu "
+                               "listado nombran distinto los productos. Por eso la renta usa el "
+                               "markup promedio. Si ves markups muy bajos/negativos, son matches "
+                               "dudosos: pasámelos y afino esos productos.")
+                    _ddf = pd.DataFrame(_diag).rename(columns={
+                        "item": "Producto", "cod": "Cód.", "un": "Unid.",
+                        "rev": "Facturación", "cogs": "Costo", "markup_pct": "Markup %"})
+                    st.dataframe(
+                        _ddf[["Producto", "Cód.", "Unid.", "Facturación", "Costo", "Markup %"]],
+                        use_container_width=True, hide_index=True)
 
     # ── Backtest AUTOMÁTICO + optimización de pesos MANUAL ────────
     st.markdown("---")
