@@ -57,6 +57,24 @@ def _norm_code(x) -> str:
         s = s.lstrip("0") or "0"
     return s
 
+# Ruido que ML mete en el seller_sku y que tapa el match con el código interno.
+_BRAND_RE = re.compile(r"\b(nat|national|nacional)\b", re.I)   # prefijo de marca
+_BULTO_RE = re.compile(r"\d+\s*bultos?", re.I)                 # '4 bultos', '1 bulto'
+_XQTY_RE  = re.compile(r"\bx\s*\d+\b", re.I)                   # sufijo 'x 1'
+
+def _extract_codes(raw) -> list:
+    """De un seller_sku 'sucio' saca los códigos internos: quita el prefijo de
+    marca ('NAT 8345' -> 8345), el ruido de bultos ('8308 4 bultos' -> 8308) y
+    el sufijo 'x N', y parte los combos ('8328 + 8331' -> [8328, 8331]).
+    Devuelve los tokens numéricos de 3-6 dígitos (posibles códigos)."""
+    if raw is None:
+        return []
+    s = str(raw).strip().lower()
+    if s in ("", "nan", "none"):
+        return []
+    s = _XQTY_RE.sub(" ", _BULTO_RE.sub(" ", _BRAND_RE.sub(" ", s)))
+    return re.findall(r"\d{3,6}", s)
+
 def _parse_money(x) -> float:
     """Convierte un valor de costo a float. Tolera 'U$S 274,00', '$1.234,56'
     (formato UY: . miles , decimal), '274.00' (US) y números planos."""
@@ -209,10 +227,21 @@ class RentaCalculator:
         o (None, None)."""
         self.load_cost_list()
         by = self._cost_by_code or {}
+        # 1) Llave exacta: el seller_sku ya es el código interno limpio.
         for raw in (seller_sku, seller_custom_field):
             k = _norm_code(raw)
             if k and k in by:
                 return by[k]["costo_usd"], k
+        # 2) SKU 'sucio': saca prefijo de marca / bultos y parte combos. Suma el
+        #    costo de las partes, pero SOLO si TODAS tienen costo en el listado:
+        #    si falta una, no se cubre (se proyecta), para no subestimar el COGS
+        #    e inflar el margen de esa línea.
+        for raw in (seller_sku, seller_custom_field):
+            keys = [_norm_code(c) for c in _extract_codes(raw)]
+            keys = [k for k in keys if k]
+            if keys and all(k in by for k in keys):
+                total = sum(by[k]["costo_usd"] for k in keys)
+                return total, "+".join(keys)
         return None, None
 
     # ─── Envíos en paralelo ───────────────────────────────────────────
